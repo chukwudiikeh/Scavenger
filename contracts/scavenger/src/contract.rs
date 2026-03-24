@@ -9,6 +9,9 @@ pub struct ScavengerContract;
 
 #[contractimpl]
 impl ScavengerContract {
+    /// Minimum allowed reward points per kilogram
+    pub const MIN_INCENTIVE_REWARD: u64 = 1;
+
     /// Initialize the contract with admin and configuration
     pub fn initialize(
         env: &Env,
@@ -220,6 +223,13 @@ impl ScavengerContract {
             "Only manufacturers can create incentives"
         );
 
+        // Validate values
+        assert!(
+            reward_points >= Self::MIN_INCENTIVE_REWARD,
+            "Reward amount is too low"
+        );
+        assert!(total_budget > 0, "Total budget must be greater than zero");
+
         // Generate incentive ID
         let incentive_id = Storage::next_incentive_id(env);
 
@@ -319,7 +329,10 @@ impl ScavengerContract {
         assert!(incentive.active, "Incentive is not active");
 
         // Validate new values
-        assert!(new_reward_points > 0, "Reward must be greater than zero");
+        assert!(
+            new_reward_points >= Self::MIN_INCENTIVE_REWARD,
+            "Reward amount is too low"
+        );
         assert!(new_total_budget > 0, "Total budget must be greater than zero");
 
         // Calculate how much budget has been used

@@ -113,7 +113,7 @@ fn test_update_incentive_inactive() {
 }
 
 #[test]
-#[should_panic(expected = "Reward must be greater than zero")]
+#[should_panic(expected = "Reward amount is too low")]
 fn test_update_incentive_zero_reward() {
     let env = Env::default();
     env.mock_all_auths();

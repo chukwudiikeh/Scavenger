@@ -271,6 +271,23 @@ fn test_create_incentive_unregistered() {
 }
 
 #[test]
+#[should_panic(expected = "Reward amount is too low")]
+fn test_create_incentive_zero_reward() {
+    let env = Env::default();
+    let (client, admin, token_address, charity_address) = create_test_contract(&env);
+    
+    env.mock_all_auths();
+    client.initialize(&admin, &token_address, &charity_address, &30, &20);
+    
+    let manufacturer = Address::generate(&env);
+    let name = String::from_str(&env, "Test Manufacturer");
+    client.register_participant(&manufacturer, &Role::Manufacturer, &name, &100, &200);
+    
+    // Try to create incentive with reward 0
+    client.create_incentive(&manufacturer, &WasteType::Metal, &0, &5000);
+}
+
+#[test]
 #[should_panic(expected = "Only manufacturers can create incentives")]
 fn test_create_incentive_wrong_role() {
     let env = Env::default();
