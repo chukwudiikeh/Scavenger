@@ -121,6 +121,25 @@ pub enum ParticipantRole {
 - `can_collect(address)` - Check collection permission
 - `can_manufacture(address)` - Check manufacturing permission
 
+## Environment Variables
+
+Copy `frontend/.env.example` to `frontend/.env` and fill in the values.
+
+| Variable | Required | Description |
+|---|---|---|
+| `VITE_CONTRACT_ID` | ✅ | Deployed Soroban contract ID |
+| `VITE_NETWORK` | ✅ | Stellar network: `TESTNET`, `MAINNET`, `FUTURENET`, or `STANDALONE` |
+| `VITE_RPC_URL` | ✅ | Soroban RPC endpoint URL |
+| `VITE_FIREBASE_API_KEY` | ✅ | Firebase project API key |
+| `VITE_FIREBASE_AUTH_DOMAIN` | ✅ | Firebase auth domain |
+| `VITE_FIREBASE_PROJECT_ID` | ✅ | Firebase project ID |
+| `VITE_FIREBASE_STORAGE_BUCKET` | ✅ | Firebase storage bucket |
+| `VITE_FIREBASE_MESSAGING_SENDER_ID` | ✅ | Firebase messaging sender ID |
+| `VITE_FIREBASE_APP_ID` | ✅ | Firebase app ID |
+| `VITE_FIREBASE_MEASUREMENT_ID` | ✅ | Firebase measurement ID |
+
+The app validates `VITE_CONTRACT_ID`, `VITE_NETWORK`, and `VITE_RPC_URL` at startup and will throw a clear error if any are missing or invalid.
+
 ## Development
 
 ```bash
