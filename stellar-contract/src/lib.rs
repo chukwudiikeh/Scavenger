@@ -1506,6 +1506,10 @@ impl ScavengerContract {
     }
 
     /// Get waste by ID (alias for backward compatibility)
+    ///
+    /// # Deprecated
+    /// Use [`get_waste`] instead. This function is an exact alias and will be
+    /// removed in a future release.
     pub fn get_waste_by_id(env: Env, waste_id: u64) -> Option<Material> {
         Self::get_waste(env, waste_id)
     }
