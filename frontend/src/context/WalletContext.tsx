@@ -1,94 +1,73 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { isConnected, getPublicKey, setAllowed } from '@stellar/freighter-api';
+import { isConnected, requestAccess, getPublicKey, isBrowser } from '@stellar/freighter-api';
 
 interface WalletContextType {
   address: string | null;
   isConnected: boolean;
+  isInstalled: boolean;
   connect: () => Promise<void>;
   disconnect: () => void;
   isLoading: boolean;
   error: string | null;
 }
 
-const WalletContext = createContext<WalletContextType | undefined>(undefined);
+const WalletContext = createContext<WalletContextType | undefined>(undefined)
 
 export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [address, setAddress] = useState<string | null>(null);
+  const [address, setAddress] = useState<string | null>(localStorage.getItem('wallet_address'));
+  const [isInstalled, setIsInstalled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    checkConnection();
+    (async () => {
+      if (!isBrowser) return setLoading(false);
+      try {
+        const connected = await isConnected();
+        setIsInstalled(true);
+        if (connected) {
+          const addr = await getPublicKey();
+          if (addr) { setAddress(addr); localStorage.setItem('wallet_address', addr); }
+        }
+      } catch {
+        setIsInstalled(false);
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, []);
 
-  const checkConnection = async () => {
-    try {
-      const connected = await isConnected();
-      if (connected) {
-        const addr = await getPublicKey();
-        if (addr) {
-          setAddress(addr);
-        }
-      }
-    } catch (err) {
-      console.error('Failed to check Freighter connection:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const connect = async () => {
-    setLoading(true);
     setError(null);
-    try {
-      const connected = await isConnected();
-      if (!connected) {
-        throw new Error('Freighter extension not found');
-      }
-      
-      const allowed = await setAllowed();
-      if (!allowed) {
-        throw new Error('Access denied to Freighter');
-      }
-
-      const addr = await getPublicKey();
-      if (addr) {
-        setAddress(addr);
-      } else {
-        throw new Error('Failed to retrieve address from Freighter');
-      }
-    } catch (err: any) {
-      setError(err.message || 'Failed to connect wallet');
-      console.error('Wallet connection error:', err);
-    } finally {
-      setLoading(false);
+    if (!isInstalled) {
+      setError('Freighter extension is not installed. Please install it from freighter.app.');
+      return;
     }
-  };
+    setLoading(true);
+    try {
+      const addr = await requestAccess();
+      setAddress(addr);
+      localStorage.setItem('wallet_address', addr);
+    } catch (err: any) {
+      const msg = err?.message ?? '';
+      setError(msg.includes('User declined') ? 'Connection rejected.' : 'Failed to connect wallet.');
+    } finally {
+      setLoading(false)
+    }
+  }
 
-  const disconnect = () => {
-    setAddress(null);
-  };
+  const disconnect = () => { setAddress(null); localStorage.removeItem('wallet_address'); };
 
   return (
-    <WalletContext.Provider 
-      value={{ 
-        address, 
-        isConnected: !!address, 
-        connect, 
-        disconnect, 
-        isLoading: loading, 
-        error 
-      }}
-    >
+    <WalletContext.Provider value={{ address, isConnected: !!address, isInstalled, connect, disconnect, isLoading: loading, error }}>
       {children}
     </WalletContext.Provider>
-  );
-};
+  )
+}
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const useWallet = () => {
-  const context = useContext(WalletContext);
-  if (context === undefined) {
-    throw new Error('useWallet must be used within a WalletProvider');
-  }
-  return context;
+  const ctx = useContext(WalletContext);
+  if (!ctx) throw new Error('useWallet must be used within a WalletProvider');
+  return ctx;
 };
