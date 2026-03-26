@@ -3,6 +3,7 @@ import { useAuth } from '@/context/AuthContext'
 import { AppShell } from '@/components/layout/AppShell'
 import { LandingPage } from '@/pages/LandingPage'
 import { HomePage } from '@/pages/HomePage'
+import { LoginPage } from '@/pages/LoginPage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
 import { IncentivesPage } from '@/pages/IncentivesPage'
 import { WasteListPage } from '@/pages/WasteListPage'
@@ -17,11 +18,13 @@ function ProtectedLayout() {
       <Outlet />
     </AppShell>
   ) : (
-    <Navigate to="/" replace />
+    <Navigate to="/login" replace />
   )
 }
 
 export const router = createBrowserRouter([
+  { path: '/', element: <Navigate to="/login" replace /> },
+  { path: '/login', element: <LoginPage /> },
   {
     // Public landing page
     path: '/',
