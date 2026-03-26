@@ -395,4 +395,12 @@ export class ScavengerClient {
   async getSupplyChainStats(): Promise<[bigint, bigint, bigint]> {
     return this.invoke<[bigint, bigint, bigint]>('get_supply_chain_stats', [])
   }
+
+  async getParticipantWastes(address: string): Promise<number[]> {
+    return this.invoke<number[]>('get_participant_wastes', [new Address(address).toScVal()])
+  }
+
+  async getActiveIncentives(): Promise<Incentive[]> {
+    return this.invoke<Incentive[]>('get_active_incentives', [])
+  }
 }

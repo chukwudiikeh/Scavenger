@@ -1,0 +1,191 @@
+import { useState, useEffect, useCallback } from 'react'
+import { Plus, Coins, Recycle, Weight } from 'lucide-react'
+import { Button } from '@/components/ui/Button'
+import { Badge } from '@/components/ui/Badge'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card'
+import { RegisterWasteModal } from '@/components/modals/RegisterWasteModal'
+import { useAuth } from '@/context/AuthContext'
+import { useAppTitle } from '@/hooks/useAppTitle'
+import { ScavengerClient } from '@/api/client'
+import { Material, Incentive, ParticipantStats, WasteType } from '@/api/types'
+import { config } from '@/config'
+import { networkConfig } from '@/lib/stellar'
+
+const client = new ScavengerClient({
+  rpcUrl: networkConfig.rpcUrl,
+  networkPassphrase: networkConfig.networkPassphrase,
+  contractId: config.contractId,
+})
+
+const WASTE_LABELS: Record<WasteType, string> = {
+  [WasteType.Paper]: 'Paper',
+  [WasteType.PetPlastic]: 'PET Plastic',
+  [WasteType.Plastic]: 'Plastic',
+  [WasteType.Metal]: 'Metal',
+  [WasteType.Glass]: 'Glass',
+}
+
+function statusVariant(m: Material): 'default' | 'secondary' | 'outline' | 'destructive' {
+  if (!m.is_active) return 'destructive'
+  if (m.is_confirmed) return 'default'
+  if (m.verified) return 'secondary'
+  return 'outline'
+}
+
+function statusLabel(m: Material): string {
+  if (!m.is_active) return 'Inactive'
+  if (m.is_confirmed) return 'Confirmed'
+  if (m.verified) return 'Verified'
+  return 'Pending'
+}
+
+export function RecyclerDashboard() {
+  useAppTitle('Dashboard — Recycler')
+  const { user } = useAuth()
+  const address = user?.address ?? ''
+
+  const [stats, setStats] = useState<ParticipantStats | null>(null)
+  const [wastes, setWastes] = useState<Material[]>([])
+  const [incentives, setIncentives] = useState<Incentive[]>([])
+  const [loading, setLoading] = useState(true)
+  const [modalOpen, setModalOpen] = useState(false)
+
+  const load = useCallback(async () => {
+    if (!address) return
+    setLoading(true)
+    try {
+      const [participantStats, wasteIds, activeIncentives] = await Promise.all([
+        client.getParticipantStats(address),
+        client.getParticipantWastes(address),
+        client.getActiveIncentives(),
+      ])
+      setStats(participantStats)
+      setIncentives(activeIncentives.slice(0, 5))
+
+      const materials = await Promise.all(
+        wasteIds.slice(-10).reverse().map((id) => client.getMaterial(id))
+      )
+      setWastes(materials.filter(Boolean) as Material[])
+    } finally {
+      setLoading(false)
+    }
+  }, [address])
+
+  useEffect(() => { load() }, [load])
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Dashboard</h1>
+        <Button onClick={() => setModalOpen(true)}>
+          <Plus className="mr-2 h-4 w-4" />
+          Register Waste
+        </Button>
+      </div>
+
+      {/* Stat cards */}
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">Token Balance</CardTitle>
+            <Coins className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">
+              {loading ? '—' : stats?.total_earned?.toString() ?? '0'}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">Wastes Submitted</CardTitle>
+            <Recycle className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">
+              {loading ? '—' : stats?.materials_submitted ?? 0}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">Transfers</CardTitle>
+            <Weight className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">
+              {loading ? '—' : stats?.transfers_count ?? 0}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Recent wastes */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Recent Wastes</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {loading ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : wastes.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No wastes submitted yet.</p>
+          ) : (
+            <div className="divide-y">
+              {wastes.map((m) => (
+                <div key={m.id} className="flex items-center justify-between py-3">
+                  <div className="space-y-0.5">
+                    <p className="text-sm font-medium">
+                      #{m.id} · {WASTE_LABELS[m.waste_type]}
+                    </p>
+                    <p className="text-xs text-muted-foreground">{m.weight} kg</p>
+                  </div>
+                  <Badge variant={statusVariant(m)}>{statusLabel(m)}</Badge>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Top active incentives */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Top Active Incentives</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {loading ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : incentives.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No active incentives.</p>
+          ) : (
+            <div className="divide-y">
+              {incentives.map((inc) => (
+                <div key={inc.id} className="flex items-center justify-between py-3">
+                  <div className="space-y-0.5">
+                    <p className="text-sm font-medium">{WASTE_LABELS[inc.waste_type]}</p>
+                    <p className="text-xs text-muted-foreground">
+                      Budget remaining: {inc.remaining_budget}
+                    </p>
+                  </div>
+                  <span className="text-sm font-semibold text-primary">
+                    {inc.reward_points} pts
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <RegisterWasteModal
+        open={modalOpen}
+        address={address}
+        onClose={() => setModalOpen(false)}
+        onSuccess={() => load()}
+      />
+    </div>
+  )
+}
