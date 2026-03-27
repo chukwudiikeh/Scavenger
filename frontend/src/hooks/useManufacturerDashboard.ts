@@ -33,26 +33,25 @@ export function useManufacturerDashboard() {
     setIsLoading(true)
     setError(null)
     try {
-      // Fetch active incentives created by this manufacturer
-      const incentiveIds = await client.getIncentivesByRewarder(address)
-      const incentiveResults = await Promise.all(
-        incentiveIds.map((id) => client.getIncentiveById(id))
-      )
-      const activeIncentives = incentiveResults.filter(
-        (i): i is Incentive => i !== null && i.active
-      )
-      setIncentives(activeIncentives)
-
-      // Fetch wastes transferred to this manufacturer pending confirmation
-      // We check each waste type for materials owned by this address
+      // Fetch active incentives for all waste types by this manufacturer
       const wasteTypeKeys = Object.values(WasteType).filter(
         (v): v is WasteType => typeof v === 'number'
       )
+      const incentiveResults = await Promise.all(
+        wasteTypeKeys.map((wt) => client.getActiveMfrIncentive(address, wt))
+      )
+      const activeIncentives = incentiveResults.filter((i): i is Incentive => i !== null)
+      setIncentives(activeIncentives)
+
+      // Fetch wastes transferred to this manufacturer pending confirmation
+      const wasteTypeKeys2 = Object.values(WasteType).filter(
+        (v): v is WasteType => typeof v === 'number'
+      )
       const allMaterials: Material[] = []
-      for (const wt of wasteTypeKeys) {
-        const ids = await client.getIncentivesByWasteType(wt)
-        for (const id of ids) {
-          const mat = await client.getMaterial(id)
+      for (const wt of wasteTypeKeys2) {
+        const incentives2 = await client.getIncentives(wt)
+        for (const inc of incentives2) {
+          const mat = await client.getMaterial(BigInt(inc.id))
           if (mat && mat.current_owner === address && !mat.is_confirmed && mat.is_active) {
             allMaterials.push(mat)
           }
@@ -61,7 +60,7 @@ export function useManufacturerDashboard() {
       setPendingWastes(allMaterials)
 
       // Reward history: use participant stats as a proxy (full history not in client)
-      const stats = await client.getParticipantStats(address)
+      const stats = await client.getStats(address)
       // Represent as a single summary entry if total_earned > 0
       if (stats.total_earned > 0n) {
         setRewardHistory([
@@ -94,9 +93,9 @@ export function useManufacturerDashboard() {
   )
 
   const confirmWaste = useCallback(
-    async (wasteId: number) => {
+    async (wasteId: number | bigint) => {
       if (!address) return
-      await client.confirmWaste(wasteId, address, address)
+      await client.confirmWasteDetails(BigInt(wasteId), address, address)
       await load()
     },
     [address, config, load]

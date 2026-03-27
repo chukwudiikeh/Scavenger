@@ -15,12 +15,7 @@ export function useTransferHistory(wasteId: number | bigint | undefined) {
         networkPassphrase: networkConfig.networkPassphrase,
         contractId: config.contractId,
       })
-
-      if (typeof wasteId === 'bigint') {
-        return client.getWasteTransferHistoryV2(wasteId)
-      }
-
-      return client.getTransferHistory(wasteId as number)
+      return client.getWasteTransferHistory(BigInt(wasteId as number))
     },
     enabled: wasteId !== undefined,
   })

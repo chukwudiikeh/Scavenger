@@ -38,20 +38,20 @@ export function useCollectorDashboard(): CollectorDashboardData {
         networkPassphrase: NETWORK_CONFIGS[config.network].networkPassphrase,
       })
 
-      const [participantStats, totalEarned] = await Promise.all([
-        client.getParticipantStats(address),
-        client.getTotalEarned(),
+      const [participantStats, metrics] = await Promise.all([
+        client.getStats(address),
+        client.getMetrics(),
       ])
 
       setStats(participantStats)
-      setTokenBalance(totalEarned)
+      setTokenBalance(metrics.total_tokens_earned ?? 0n)
 
       // Fetch all materials owned by this collector
       const wasteIds: number[] = []
       for (let i = 1; i <= participantStats.materials_submitted; i++) wasteIds.push(i)
 
       const materials = (
-        await Promise.all(wasteIds.map((id) => client.getMaterial(id)))
+        await Promise.all(wasteIds.map((id) => client.getMaterial(BigInt(id))))
       ).filter((m): m is Material => m !== null && m.current_owner === address && m.is_active)
 
       // Pending = transferred to this collector but not yet confirmed

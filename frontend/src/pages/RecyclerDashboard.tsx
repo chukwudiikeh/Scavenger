@@ -55,7 +55,7 @@ export function RecyclerDashboard() {
     setLoading(true)
     try {
       const [participantStats, wasteIds, activeIncentives] = await Promise.all([
-        client.getParticipantStats(address),
+        client.getStats(address),
         client.getParticipantWastes(address),
         client.getActiveIncentives(),
       ])

@@ -13,7 +13,8 @@ import {
 import { useWallet } from '@/context/WalletContext'
 import { useAuth } from '@/context/AuthContext'
 import { useAppTitle } from '@/hooks/useAppTitle'
-import { ScavengerClient } from '@/api/client'
+import { useRegisterParticipant } from '@/hooks/useRegisterParticipant'
+import { ScavengerClient } from '@/lib/contract'
 import { Role } from '@/api/types'
 import { config } from '@/config'
 import { networkConfig } from '@/lib/stellar'
@@ -36,6 +37,7 @@ export function LoginPage() {
   const navigate = useNavigate()
   const { address, isConnected, connect, isLoading: walletLoading, error: walletError } = useWallet()
   const { login } = useAuth()
+  const registerMutation = useRegisterParticipant()
 
   const [checking, setChecking] = useState(false)
   const [isRegistered, setIsRegistered] = useState<boolean | null>(null)
@@ -43,8 +45,6 @@ export function LoginPage() {
   // Registration form state
   const [name, setName] = useState('')
   const [role, setRole] = useState<Role>(Role.Recycler)
-  const [submitting, setSubmitting] = useState(false)
-  const [formError, setFormError] = useState<string | null>(null)
 
   // Once wallet connects, check registration status
   useEffect(() => {
@@ -69,17 +69,15 @@ export function LoginPage() {
   async function handleRegister(e: React.FormEvent) {
     e.preventDefault()
     if (!address || !name.trim()) return
-    setFormError(null)
-    setSubmitting(true)
-    try {
-      const participant = await client.registerParticipant(address, role, name.trim(), 0, 0, address)
-      login({ address, role: participant.role, name: participant.name })
-      navigate('/dashboard', { replace: true })
-    } catch (err: any) {
-      setFormError(err?.message ?? 'Registration failed. Please try again.')
-    } finally {
-      setSubmitting(false)
-    }
+    registerMutation.mutate(
+      { address, role, name: name.trim() },
+      {
+        onSuccess: (participant) => {
+          login({ address, role: participant.role, name: participant.name })
+          navigate('/dashboard', { replace: true })
+        },
+      }
+    )
   }
 
   const isbusy = walletLoading || checking
@@ -149,10 +147,12 @@ export function LoginPage() {
               </Select>
             </div>
 
-            {formError && <p className="text-sm text-destructive">{formError}</p>}
+            {registerMutation.isError && (
+              <p className="text-sm text-destructive">{registerMutation.error?.message ?? 'Registration failed. Please try again.'}</p>
+            )}
 
-            <Button type="submit" className="w-full" disabled={submitting || !name.trim()}>
-              {submitting ? 'Registering…' : 'Create Account'}
+            <Button type="submit" className="w-full" disabled={registerMutation.isPending || !name.trim()}>
+              {registerMutation.isPending ? 'Registering…' : 'Create Account'}
             </Button>
           </form>
         )}

@@ -35,15 +35,15 @@ export function useWasteList() {
 
   useEffect(() => { load() }, [load])
 
-  const confirmWaste = useCallback(async (wasteId: number) => {
+  const confirmWaste = useCallback(async (wasteId: number | bigint) => {
     if (!address) return
-    await client.confirmWaste(wasteId, address, address)
+    await client.confirmWasteDetails(BigInt(wasteId), address, address)
     await load()
   }, [address, config, load])
 
-  const transferWaste = useCallback(async (wasteId: number, to: string) => {
+  const transferWaste = useCallback(async (wasteId: number | bigint, to: string) => {
     if (!address) return
-    await client.transferWaste(wasteId, address, to, address)
+    await client.transferWaste(BigInt(wasteId), address, to, 0n, 0n, '', address)
     await load()
   }, [address, config, load])
 
