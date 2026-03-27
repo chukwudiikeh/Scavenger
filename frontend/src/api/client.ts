@@ -1,4 +1,15 @@
-import { Contract, rpc, xdr, scValToNative, nativeToScVal, Address } from '@stellar/stellar-sdk'
+import {
+  Contract,
+  rpc as SorobanRpc,
+  xdr,
+  scValToNative,
+  nativeToScVal,
+  Address,
+  TransactionBuilder,
+  BASE_FEE,
+  Networks,
+} from '@stellar/stellar-sdk'
+import { signTransaction } from '@stellar/freighter-api'
 import {
   Role,
   WasteType,
@@ -9,12 +20,8 @@ import {
   WasteTransfer,
   ParticipantStats,
   GlobalMetrics,
-  ContractError
+  ContractError,
 } from './types'
-
-// Constants
-const DEFAULT_RETRIES = 3
-const RETRY_DELAY_MS = 1000
 
 export interface ClientOptions {
   rpcUrl: string
@@ -24,197 +31,159 @@ export interface ClientOptions {
 
 export class ScavengerClient {
   private contract: Contract
-
-  // State for UI to hook into if desired
-  public isLoading: boolean = false
-  private stateChangeListeners: ((loading: boolean) => void)[] = []
+  private server: SorobanRpc.Server
+  private networkPassphrase: string
 
   constructor(options: ClientOptions) {
     this.contract = new Contract(options.contractId)
+    this.server = new SorobanRpc.Server(options.rpcUrl, { allowHttp: true })
+    this.networkPassphrase = options.networkPassphrase
   }
 
-  // --- State management for loading states ---
-  public subscribe(listener: (loading: boolean) => void) {
-    this.stateChangeListeners.push(listener)
-    return () => {
-      this.stateChangeListeners = this.stateChangeListeners.filter((l) => l !== listener)
-    }
-  }
-
-  private setLoading(loading: boolean) {
-    this.isLoading = loading
-    this.stateChangeListeners.forEach((listener) => listener(loading))
-  }
-
-  // --- Helper: Generic invoke with retry logic and error handling ---
+  /**
+   * Build, simulate, sign (via Freighter), and submit a Soroban transaction.
+   * For read-only calls (no signer), simulation result is returned directly.
+   */
   private async invoke<T>(
     method: string,
     args: xdr.ScVal[],
-    signer?: string, // user address for auth if this was a full transaction
-    retries = DEFAULT_RETRIES
+    signer?: string
   ): Promise<T> {
-    let attempt = 0
+    const operation = this.contract.call(method, ...args)
 
-    this.setLoading(true)
-
-    while (attempt < retries) {
-      try {
-        // MOCK implementation to satisfy TypeScript and provide structure
-        // In a real implementation this would build the transaction using the contract call:
-        // this.contract.call(method, ...args);
-
-        // Suppress unused variable warnings
-        console.debug(method, args, signer, rpc, this.contract)
-
-        const result = await Promise.resolve({
-          result: { retval: nativeToScVal('MOCK', { type: 'string' }) }
-        })
-
-        // Map Soroban Error
-        const resultAny = result as unknown as {
-          error?: string
-          errorCode?: number
-          result?: { retval?: ReturnType<typeof nativeToScVal> }
-        }
-        if (resultAny.error) {
-          throw new ContractError(resultAny.error, resultAny.errorCode)
-        }
-
-        const scVal = resultAny.result?.retval
-        if (!scVal) throw new ContractError('No return value from contract')
-
-        return scValToNative(scVal) as T
-      } catch (error: unknown) {
-        attempt++
-        if (attempt >= retries) {
-          this.setLoading(false)
-          const errorMsg = error instanceof Error ? error.message : 'Unknown Contract Error'
-          throw new ContractError(`Failed to invoke ${method}: ${errorMsg}`)
-        }
-        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt))
-      }
+    if (!signer) {
+      // Read-only: simulate only
+      const sim = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount('GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN'),
+          { fee: BASE_FEE, networkPassphrase: this.networkPassphrase }
+        )
+          .addOperation(operation)
+          .setTimeout(30)
+          .build()
+      )
+      return this._extractSimResult<T>(sim)
     }
 
-    this.setLoading(false)
-    throw new ContractError('Exhausted retries')
+    // Mutating: build → simulate → assemble → sign → submit
+    const account = await this.server.getAccount(signer)
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build()
+
+    const sim = await this.server.simulateTransaction(tx)
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throw this._parseError(sim.error)
+    }
+
+    const assembled = SorobanRpc.assembleTransaction(tx, sim).build()
+
+    const { signedTxXdr } = await signTransaction(assembled.toXDR(), {
+      networkPassphrase: this.networkPassphrase,
+    })
+
+    const signed = TransactionBuilder.fromXDR(signedTxXdr, this.networkPassphrase)
+    const sendResult = await this.server.sendTransaction(signed)
+
+    if (sendResult.status === 'ERROR') {
+      throw this._parseError(sendResult.errorResult?.toXDR('base64') ?? 'Transaction failed')
+    }
+
+    // Poll for confirmation
+    const hash = sendResult.hash
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1500))
+      const status = await this.server.getTransaction(hash)
+      if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+        const retval = (status as SorobanRpc.Api.GetSuccessfulTransactionResponse).returnValue
+        if (!retval) return undefined as T
+        return scValToNative(retval) as T
+      }
+      if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+        throw new ContractError('Transaction failed on-chain')
+      }
+    }
+    throw new ContractError('Transaction confirmation timeout')
+  }
+
+  private _extractSimResult<T>(sim: SorobanRpc.Api.SimulateTransactionResponse): T {
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throw this._parseError(sim.error)
+    }
+    const result = (sim as SorobanRpc.Api.SimulateTransactionSuccessResponse).result
+    if (!result?.retval) return undefined as T
+    return scValToNative(result.retval) as T
+  }
+
+  private _parseError(raw: string): ContractError {
+    // Try to extract numeric error code from XDR or message
+    const match = raw.match(/Error\(Contract, #(\d+)\)/)
+    if (match) return new ContractError(`Contract error #${match[1]}`, Number(match[1]))
+    return new ContractError(raw)
   }
 
   // =======================================================
-  // Contract Methods wrapping
+  // Admin
   // =======================================================
 
-  async initialize(
-    admin: string,
-    tokenAddress: string,
-    charityAddress: string,
-    collectorPercentage: number,
-    ownerPercentage: number,
-    signer: string
-  ) {
-    return this.invoke<void>(
-      'initialize',
-      [
-        new Address(admin).toScVal(),
-        new Address(tokenAddress).toScVal(),
-        new Address(charityAddress).toScVal(),
-        nativeToScVal(collectorPercentage, { type: 'u32' }),
-        nativeToScVal(ownerPercentage, { type: 'u32' })
-      ],
-      signer
-    )
+  async initializeAdmin(admin: string) {
+    return this.invoke<void>('initialize_admin', [new Address(admin).toScVal()], admin)
   }
 
   async getAdmin(): Promise<string> {
     return this.invoke<string>('get_admin', [])
   }
 
-  async getTokenAddress(): Promise<string> {
-    return this.invoke<string>('get_token_address', [])
-  }
-
-  async getCharityAddress(): Promise<string> {
-    return this.invoke<string>('get_charity_address', [])
-  }
-
-  async getCollectorPercentage(): Promise<number> {
-    return this.invoke<number>('get_collector_percentage', [])
-  }
-
-  async getOwnerPercentage(): Promise<number> {
-    return this.invoke<number>('get_owner_percentage', [])
-  }
-
-  async getTotalEarned(): Promise<bigint> {
-    return this.invoke<bigint>('get_total_earned', [])
-  }
-
-  async getMetrics(): Promise<GlobalMetrics> {
-    return this.invoke<GlobalMetrics>('get_metrics', [])
-  }
-
-  async updateTokenAddress(admin: string, newAddress: string, signer: string) {
-    return this.invoke<void>(
-      'update_token_address',
-      [new Address(admin).toScVal(), new Address(newAddress).toScVal()],
-      signer
-    )
-  }
-
-  async updateCharityAddress(admin: string, newAddress: string, signer: string) {
-    return this.invoke<void>(
-      'update_charity_address',
-      [new Address(admin).toScVal(), new Address(newAddress).toScVal()],
-      signer
-    )
-  }
-
-  async updateCollectorPercentage(admin: string, newPercentage: number, signer: string) {
-    return this.invoke<void>(
-      'update_collector_percentage',
-      [new Address(admin).toScVal(), nativeToScVal(newPercentage, { type: 'u32' })],
-      signer
-    )
-  }
-
-  async updateOwnerPercentage(admin: string, newPercentage: number, signer: string) {
-    return this.invoke<void>(
-      'update_owner_percentage',
-      [new Address(admin).toScVal(), nativeToScVal(newPercentage, { type: 'u32' })],
-      signer
-    )
-  }
-
-  async updatePercentages(
-    admin: string,
-    collectorPercentage: number,
-    ownerPercentage: number,
-    signer: string
-  ) {
-    return this.invoke<void>(
-      'update_percentages',
-      [
-        new Address(admin).toScVal(),
-        nativeToScVal(collectorPercentage, { type: 'u32' }),
-        nativeToScVal(ownerPercentage, { type: 'u32' })
-      ],
-      signer
-    )
-  }
-
-  async transferAdmin(currentAdmin: string, newAdmin: string, signer: string) {
+  async transferAdmin(currentAdmin: string, newAdmin: string) {
     return this.invoke<void>(
       'transfer_admin',
       [new Address(currentAdmin).toScVal(), new Address(newAdmin).toScVal()],
-      signer
+      currentAdmin
     )
   }
+
+  async setCharityContract(admin: string, charityAddress: string) {
+    return this.invoke<void>(
+      'set_charity_contract',
+      [new Address(admin).toScVal(), new Address(charityAddress).toScVal()],
+      admin
+    )
+  }
+
+  async setTokenAddress(admin: string, tokenAddress: string) {
+    return this.invoke<void>(
+      'set_token_address',
+      [new Address(admin).toScVal(), new Address(tokenAddress).toScVal()],
+      admin
+    )
+  }
+
+  async setPercentages(admin: string, collectorPct: number, ownerPct: number) {
+    return this.invoke<void>(
+      'set_percentages',
+      [
+        new Address(admin).toScVal(),
+        nativeToScVal(collectorPct, { type: 'u32' }),
+        nativeToScVal(ownerPct, { type: 'u32' }),
+      ],
+      admin
+    )
+  }
+
+  // =======================================================
+  // Participants
+  // =======================================================
 
   async registerParticipant(
     address: string,
     role: Role,
     name: string,
-    latitude: number,
-    longitude: number,
+    lat: number,
+    lon: number,
     signer: string
   ): Promise<Participant> {
     return this.invoke<Participant>(
@@ -223,8 +192,8 @@ export class ScavengerClient {
         new Address(address).toScVal(),
         nativeToScVal(role),
         nativeToScVal(name, { type: 'string' }),
-        nativeToScVal(latitude, { type: 'i64' }),
-        nativeToScVal(longitude, { type: 'i64' })
+        nativeToScVal(lat, { type: 'i128' }),
+        nativeToScVal(lon, { type: 'i128' }),
       ],
       signer
     )
@@ -234,217 +203,282 @@ export class ScavengerClient {
     return this.invoke<Participant | null>('get_participant', [new Address(address).toScVal()])
   }
 
+  async getParticipantInfo(address: string): Promise<{ participant: Participant; stats: ParticipantStats } | null> {
+    return this.invoke<{ participant: Participant; stats: ParticipantStats } | null>(
+      'get_participant_info',
+      [new Address(address).toScVal()]
+    )
+  }
+
+  async updateRole(address: string, newRole: Role, signer: string) {
+    return this.invoke<void>(
+      'update_role',
+      [new Address(address).toScVal(), nativeToScVal(newRole)],
+      signer
+    )
+  }
+
+  async deregisterParticipant(address: string, signer: string) {
+    return this.invoke<void>(
+      'deregister_participant',
+      [new Address(address).toScVal()],
+      signer
+    )
+  }
+
   async isParticipantRegistered(address: string): Promise<boolean> {
     return this.invoke<boolean>('is_participant_registered', [new Address(address).toScVal()])
   }
 
-  async createIncentive(
-    rewarder: string,
-    wasteType: WasteType,
-    rewardPoints: bigint,
-    totalBudget: bigint,
-    signer: string
-  ): Promise<Incentive> {
-    return this.invoke<Incentive>(
-      'create_incentive',
-      [
-        new Address(rewarder).toScVal(),
-        nativeToScVal(wasteType),
-        nativeToScVal(rewardPoints, { type: 'u64' }),
-        nativeToScVal(totalBudget, { type: 'u64' })
-      ],
-      signer
-    )
-  }
-
-  async getIncentiveById(incentiveId: number): Promise<Incentive | null> {
-    return this.invoke<Incentive | null>('get_incentive_by_id', [
-      nativeToScVal(incentiveId, { type: 'u64' })
-    ])
-  }
-
-  async incentiveExists(incentiveId: number): Promise<boolean> {
-    return this.invoke<boolean>('incentive_exists', [nativeToScVal(incentiveId, { type: 'u64' })])
-  }
-
-  async getIncentivesByRewarder(rewarder: string): Promise<number[]> {
-    return this.invoke<number[]>('get_incentives_by_rewarder', [new Address(rewarder).toScVal()])
-  }
-
-  async getIncentivesByWasteType(wasteType: WasteType): Promise<number[]> {
-    return this.invoke<number[]>('get_incentives_by_waste_type', [nativeToScVal(wasteType)])
-  }
-
-  async getActiveIncentive(manufacturer: string, wasteType: WasteType): Promise<Incentive | null> {
-    return this.invoke<Incentive | null>('get_active_incentive', [
-      new Address(manufacturer).toScVal(),
-      nativeToScVal(wasteType)
-    ])
-  }
-
-  async getIncentives(wasteType: WasteType): Promise<Incentive[]> {
-    return this.invoke<Incentive[]>('get_incentives', [nativeToScVal(wasteType)])
-  }
-
-  async getAllActiveIncentives(): Promise<Incentive[]> {
-    return this.invoke<Incentive[]>('get_active_incentives', [])
-  }
-
-  async updateIncentive(
-    incentiveId: number,
-    newRewardPoints: bigint,
-    newTotalBudget: bigint,
-    signer: string
-  ): Promise<Incentive> {
-    return this.invoke<Incentive>(
-      'update_incentive',
-      [
-        nativeToScVal(incentiveId, { type: 'u64' }),
-        nativeToScVal(newRewardPoints, { type: 'u64' }),
-        nativeToScVal(newTotalBudget, { type: 'u64' })
-      ],
-      signer
-    )
-  }
-
-  async deactivateIncentive(rewarder: string, incentiveId: number, signer: string): Promise<void> {
-    return this.invoke<void>(
-      'deactivate_incentive',
-      [new Address(rewarder).toScVal(), nativeToScVal(incentiveId, { type: 'u64' })],
-      signer
-    )
-  }
+  // =======================================================
+  // Waste / Materials
+  // =======================================================
 
   async submitMaterial(
     submitter: string,
     wasteType: WasteType,
     weight: bigint,
+    lat: bigint,
+    lon: bigint,
     signer: string
   ): Promise<Material> {
     return this.invoke<Material>(
       'submit_material',
       [
         new Address(submitter).toScVal(),
-        nativeToScVal(wasteType),
-        nativeToScVal(weight, { type: 'u64' })
+        nativeToScVal(wasteType, { type: 'u32' }),
+        nativeToScVal(weight, { type: 'u128' }),
+        nativeToScVal(lat, { type: 'i128' }),
+        nativeToScVal(lon, { type: 'i128' }),
       ],
       signer
     )
   }
 
-  async getMaterial(materialId: number): Promise<Material | null> {
-    return this.invoke<Material | null>('get_material', [
-      nativeToScVal(materialId, { type: 'u64' })
-    ])
-  }
-
-  async getParticipantWastes(address: string): Promise<number[]> {
-    return this.invoke<number[]>('get_participant_wastes', [new Address(address).toScVal()])
-  }
-
-  async deactivateWaste(admin: string, wasteId: number, signer: string): Promise<void> {
-    return this.invoke<void>(
-      'deactivate_waste',
-      [new Address(admin).toScVal(), nativeToScVal(wasteId, { type: 'u64' })],
+  async submitMaterialsBatch(
+    submitter: string,
+    materials: { wasteType: WasteType; weight: bigint }[],
+    signer: string
+  ): Promise<Material[]> {
+    const vec = nativeToScVal(
+      materials.map((m) => ({
+        waste_type: nativeToScVal(m.wasteType, { type: 'u32' }),
+        weight: nativeToScVal(m.weight, { type: 'u128' }),
+      }))
+    )
+    return this.invoke<Material[]>(
+      'submit_materials_batch',
+      [new Address(submitter).toScVal(), vec],
       signer
     )
   }
 
-  async confirmWaste(wasteId: number, confirmer: string, signer: string): Promise<void> {
+  async verifyMaterial(materialId: bigint, verifier: string, signer: string) {
     return this.invoke<void>(
-      'confirm_waste',
-      [nativeToScVal(wasteId, { type: 'u64' }), new Address(confirmer).toScVal()],
+      'verify_material',
+      [nativeToScVal(materialId, { type: 'u64' }), new Address(verifier).toScVal()],
       signer
     )
   }
 
-  async resetWasteConfirmation(wasteId: number, owner: string, signer: string): Promise<void> {
-    return this.invoke<void>(
-      'reset_waste_confirmation',
-      [nativeToScVal(wasteId, { type: 'u64' }), new Address(owner).toScVal()],
-      signer
-    )
-  }
-
-  async transferWaste(wasteId: number, from: string, to: string, signer: string): Promise<void> {
+  async transferWaste(
+    wasteId: bigint,
+    from: string,
+    to: string,
+    lat: bigint,
+    lon: bigint,
+    note: string,
+    signer: string
+  ) {
     return this.invoke<void>(
       'transfer_waste',
       [
-        nativeToScVal(wasteId, { type: 'u64' }),
+        nativeToScVal(wasteId, { type: 'u128' }),
         new Address(from).toScVal(),
-        new Address(to).toScVal()
+        new Address(to).toScVal(),
+        nativeToScVal(lat, { type: 'i128' }),
+        nativeToScVal(lon, { type: 'i128' }),
+        nativeToScVal(note, { type: 'string' }),
       ],
       signer
     )
   }
 
-  async getTransferHistory(wasteId: number): Promise<WasteTransfer[]> {
-    return this.invoke<WasteTransfer[]>('get_transfer_history', [
-      nativeToScVal(wasteId, { type: 'u64' })
+  async confirmWasteDetails(wasteId: bigint, confirmer: string, signer: string) {
+    return this.invoke<void>(
+      'confirm_waste_details',
+      [nativeToScVal(wasteId, { type: 'u128' }), new Address(confirmer).toScVal()],
+      signer
+    )
+  }
+
+  async resetWasteConfirmation(wasteId: bigint, owner: string, signer: string) {
+    return this.invoke<void>(
+      'reset_waste_confirmation',
+      [nativeToScVal(wasteId, { type: 'u128' }), new Address(owner).toScVal()],
+      signer
+    )
+  }
+
+  async deactivateWaste(admin: string, wasteId: bigint, signer: string) {
+    return this.invoke<void>(
+      'deactivate_waste',
+      [new Address(admin).toScVal(), nativeToScVal(wasteId, { type: 'u128' })],
+      signer
+    )
+  }
+
+  async getWaste(wasteId: bigint): Promise<Waste | null> {
+    return this.invoke<Waste | null>('get_waste', [nativeToScVal(wasteId, { type: 'u128' })])
+  }
+
+  async getMaterial(materialId: bigint): Promise<Material | null> {
+    return this.invoke<Material | null>('get_material', [nativeToScVal(materialId, { type: 'u64' })])
+  }
+
+  async getParticipantWastes(address: string): Promise<bigint[]> {
+    return this.invoke<bigint[]>('get_participant_wastes', [new Address(address).toScVal()])
+  }
+
+  async getWasteTransferHistory(wasteId: bigint): Promise<WasteTransfer[]> {
+    return this.invoke<WasteTransfer[]>('get_waste_transfer_history', [
+      nativeToScVal(wasteId, { type: 'u128' }),
     ])
   }
 
-  async getWasteTransferHistoryV2(wasteId: bigint): Promise<WasteTransfer[]> {
-    return this.invoke<WasteTransfer[]>('get_waste_transfer_history_v2', [
-      nativeToScVal(wasteId, { type: 'u128' })
-    ])
-  }
+  // =======================================================
+  // Incentives
+  // =======================================================
 
-  async distributeRewards(
-    wasteId: number,
-    incentiveId: number,
-    manufacturer: string,
+  async createIncentive(
+    rewarder: string,
+    wasteType: WasteType,
+    rewardPoints: bigint,
+    budget: bigint,
     signer: string
-  ): Promise<bigint> {
-    return this.invoke<bigint>(
-      'distribute_rewards',
+  ): Promise<Incentive> {
+    return this.invoke<Incentive>(
+      'create_incentive',
       [
-        nativeToScVal(wasteId, { type: 'u64' }),
-        nativeToScVal(incentiveId, { type: 'u64' }),
-        new Address(manufacturer).toScVal()
+        new Address(rewarder).toScVal(),
+        nativeToScVal(wasteType, { type: 'u32' }),
+        nativeToScVal(rewardPoints, { type: 'u64' }),
+        nativeToScVal(budget, { type: 'u64' }),
       ],
       signer
     )
   }
 
-  async getParticipantStats(address: string): Promise<ParticipantStats> {
-    return this.invoke<ParticipantStats>('get_participant_stats', [new Address(address).toScVal()])
+  async updateIncentive(
+    incentiveId: bigint,
+    rewarder: string,
+    rewardPoints: bigint,
+    budget: bigint,
+    signer: string
+  ): Promise<Incentive> {
+    return this.invoke<Incentive>(
+      'update_incentive',
+      [
+        nativeToScVal(incentiveId, { type: 'u64' }),
+        new Address(rewarder).toScVal(),
+        nativeToScVal(rewardPoints, { type: 'u64' }),
+        nativeToScVal(budget, { type: 'u64' }),
+      ],
+      signer
+    )
   }
 
-  async getSupplyChainStats(): Promise<[bigint, bigint, bigint]> {
-    return this.invoke<[bigint, bigint, bigint]>('get_supply_chain_stats', [])
+  async deactivateIncentive(incentiveId: bigint, rewarder: string, signer: string) {
+    return this.invoke<void>(
+      'deactivate_incentive',
+      [nativeToScVal(incentiveId, { type: 'u64' }), new Address(rewarder).toScVal()],
+      signer
+    )
+  }
+
+  async getIncentiveById(incentiveId: bigint): Promise<Incentive | null> {
+    return this.invoke<Incentive | null>('get_incentive_by_id', [
+      nativeToScVal(incentiveId, { type: 'u64' }),
+    ])
+  }
+
+  async getIncentives(wasteType: WasteType): Promise<Incentive[]> {
+    return this.invoke<Incentive[]>('get_incentives', [nativeToScVal(wasteType, { type: 'u32' })])
   }
 
   async getActiveIncentives(): Promise<Incentive[]> {
     return this.invoke<Incentive[]>('get_active_incentives', [])
   }
 
-  async recycleWaste(
-    recycler: string,
-    wasteType: WasteType,
-    weight: bigint,
-    latitude: bigint,
-    longitude: bigint,
+  async getActiveMfrIncentive(manufacturer: string, wasteType: WasteType): Promise<Incentive | null> {
+    return this.invoke<Incentive | null>('get_active_mfr_incentive', [
+      new Address(manufacturer).toScVal(),
+      nativeToScVal(wasteType, { type: 'u32' }),
+    ])
+  }
+
+  async distributeRewards(
+    wasteId: bigint,
+    incentiveId: bigint,
+    manufacturer: string,
     signer: string
   ): Promise<bigint> {
     return this.invoke<bigint>(
-      'recycle_waste',
+      'distribute_rewards',
       [
-        nativeToScVal(wasteType),
-        nativeToScVal(weight, { type: 'u128' }),
-        new Address(recycler).toScVal(),
-        nativeToScVal(latitude, { type: 'i128' }),
-        nativeToScVal(longitude, { type: 'i128' }),
+        nativeToScVal(wasteId, { type: 'u128' }),
+        nativeToScVal(incentiveId, { type: 'u64' }),
+        new Address(manufacturer).toScVal(),
       ],
       signer
     )
   }
 
-  async getParticipantWastesV2(address: string): Promise<bigint[]> {
-    return this.invoke<bigint[]>('get_participant_wastes_v2', [new Address(address).toScVal()])
+  // =======================================================
+  // Stats & Metrics
+  // =======================================================
+
+  async getMetrics(): Promise<GlobalMetrics> {
+    return this.invoke<GlobalMetrics>('get_metrics', [])
   }
 
+  async getStats(participant: string): Promise<ParticipantStats> {
+    return this.invoke<ParticipantStats>('get_stats', [new Address(participant).toScVal()])
+  }
+
+  async getSupplyChainStats(): Promise<{ total_wastes: bigint; total_weight: bigint; total_tokens: bigint }> {
+    return this.invoke('get_supply_chain_stats', [])
+  }
+
+  // =======================================================
+  // Legacy aliases kept for backward compatibility
+  // =======================================================
+
+  /** @deprecated Use getWaste */
   async getWasteV2(wasteId: bigint): Promise<Waste | null> {
-    return this.invoke<Waste | null>('get_waste_v2', [nativeToScVal(wasteId, { type: 'u128' })])
+    return this.getWaste(wasteId)
+  }
+
+  /** @deprecated Use getParticipantWastes */
+  async getParticipantWastesV2(address: string): Promise<bigint[]> {
+    return this.getParticipantWastes(address)
+  }
+
+  /** @deprecated Use getWasteTransferHistory */
+  async getWasteTransferHistoryV2(wasteId: bigint): Promise<WasteTransfer[]> {
+    return this.getWasteTransferHistory(wasteId)
+  }
+
+  /** @deprecated Use submitMaterial */
+  async recycleWaste(
+    recycler: string,
+    wasteType: WasteType,
+    weightGrams: bigint,
+    latitude: bigint,
+    longitude: bigint,
+    signer: string
+  ): Promise<bigint> {
+    const material = await this.submitMaterial(recycler, wasteType, weightGrams, latitude, longitude, signer)
+    return BigInt(material.id)
   }
 }

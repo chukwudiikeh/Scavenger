@@ -18,10 +18,10 @@ export function useSupplyChainStats() {
   useEffect(() => {
     async function fetch() {
       setIsLoading(true)
-      const [wastes, weight, tokens] = await client.getSupplyChainStats()
-      setTotalWastes(wastes)
-      setTotalWeight(weight)
-      setTotalTokens(tokens)
+      const stats = await client.getSupplyChainStats()
+      setTotalWastes(stats.total_wastes)
+      setTotalWeight(stats.total_weight)
+      setTotalTokens(stats.total_tokens)
       setIsLoading(false)
     }
 

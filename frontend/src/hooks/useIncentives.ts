@@ -1,25 +1,16 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Incentive, WasteType } from '@/api/types'
 import { useContract } from '@/context/ContractContext'
 import { networkConfig } from '@/lib/stellar'
-import { useState, useEffect, useCallback } from 'react'
 import { useWallet } from '@/context/WalletContext'
 import { ScavengerClient } from '@/api/client'
-import { getNetworkPassphrase } from '@/lib/stellar'
 
 const INCENTIVES_STALE_TIME = 30 * 1000 // 30 seconds
 
-const ALL_WASTE_TYPES = [
-  WasteType.Paper,
-  WasteType.PetPlastic,
-  WasteType.Plastic,
-  WasteType.Metal,
-  WasteType.Glass,
-]
-
-
 export function useIncentives(wasteType?: WasteType) {
   const { config } = useContract()
+  const { address } = useWallet()
+  const queryClient = useQueryClient()
 
   const { data, isLoading, isError } = useQuery<Incentive[]>({
     queryKey: ['incentives', wasteType ?? 'all'],
@@ -29,71 +20,56 @@ export function useIncentives(wasteType?: WasteType) {
         networkPassphrase: networkConfig.networkPassphrase,
         contractId: config.contractId,
       })
-
-      if (wasteType !== undefined) {
-        return client.getIncentives(wasteType)
-      }
-
-      return client.getAllActiveIncentives()
+      if (wasteType !== undefined) return client.getIncentives(wasteType)
+      return client.getActiveIncentives()
     },
     staleTime: INCENTIVES_STALE_TIME,
   })
-  
-    const client = new ScavengerClient({
-    rpcUrl: config.rpcUrl,
-    networkPassphrase: getNetworkPassphrase(config.network),
-    contractId: config.contractId,
+
+  const getClient = () =>
+    new ScavengerClient({
+      rpcUrl: config.rpcUrl,
+      networkPassphrase: networkConfig.networkPassphrase,
+      contractId: config.contractId,
+    })
+
+  const invalidate = () =>
+    queryClient.invalidateQueries({ queryKey: ['incentives'] })
+
+  const createIncentive = useMutation({
+    mutationFn: ({ wt, rewardPoints, budget }: { wt: WasteType; rewardPoints: bigint; budget: bigint }) => {
+      if (!address) throw new Error('Wallet not connected')
+      return getClient().createIncentive(address, wt, rewardPoints, budget, address)
+    },
+    onSuccess: invalidate,
   })
 
-  const load = useCallback(async () => {
-    setIsLoading(true)
-    setError(null)
-    try {
-      const idSets = await Promise.all(
-        ALL_WASTE_TYPES.map((wt) => client.getIncentivesByWasteType(wt))
-      )
-      const allIds = [...new Set(idSets.flat())]
-      const results = await Promise.all(allIds.map((id) => client.getIncentiveById(id)))
-      setIncentives(results.filter((i): i is Incentive => i !== null && i.active))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load incentives')
-    } finally {
-      setIsLoading(false)
-    }
-  }, [config])
-
-  useEffect(() => { load() }, [load])
-
-  const createIncentive = useCallback(
-    async (wasteType: WasteType, rewardPoints: bigint, budget: bigint) => {
-      if (!address) return
-      await client.createIncentive(address, wasteType, rewardPoints, budget, address)
-      await load()
+  const updateIncentive = useMutation({
+    mutationFn: ({ id, rewardPoints, budget }: { id: bigint; rewardPoints: bigint; budget: bigint }) => {
+      if (!address) throw new Error('Wallet not connected')
+      return getClient().updateIncentive(id, address, rewardPoints, budget, address)
     },
-    [address, config, load]
-  )
+    onSuccess: invalidate,
+  })
 
-  const updateIncentive = useCallback(
-    async (id: number, rewardPoints: bigint, budget: bigint) => {
-      if (!address) return
-      await client.updateIncentive(id, rewardPoints, budget, address)
-      await load()
+  const deactivateIncentive = useMutation({
+    mutationFn: ({ id }: { id: bigint }) => {
+      if (!address) throw new Error('Wallet not connected')
+      return getClient().deactivateIncentive(id, address, address)
     },
-    [address, config, load]
-  )
-
-  const deactivateIncentive = useCallback(
-    async (id: number) => {
-      if (!address) return
-      await client.deactivateIncentive(address, id, address)
-      await load()
-    },
-    [address, config, load]
-  )
+    onSuccess: invalidate,
+  })
 
   return {
     incentives: data ?? [],
     isLoading,
-    isError, isLoading, error, address, createIncentive, updateIncentive, deactivateIncentive
+    isError,
+    error: isError ? 'Failed to load incentives' : null,
+    address,
+    createIncentive: (wt: WasteType, rewardPoints: bigint, budget: bigint) =>
+      createIncentive.mutateAsync({ wt, rewardPoints, budget }),
+    updateIncentive: (id: number | bigint, rewardPoints: bigint, budget: bigint) =>
+      updateIncentive.mutateAsync({ id: BigInt(id), rewardPoints, budget }),
+    deactivateIncentive: (id: number | bigint) => deactivateIncentive.mutateAsync({ id: BigInt(id) }),
   }
 }
