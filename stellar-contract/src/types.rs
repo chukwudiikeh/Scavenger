@@ -195,6 +195,39 @@ impl TransferRecord {
     }
 }
 
+/// Reputation badge tier for a participant.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReputationBadge {
+    /// No badge — score below Bronze threshold
+    None = 0,
+    /// Bronze — score >= 100
+    Bronze = 1,
+    /// Silver — score >= 500
+    Silver = 2,
+    /// Gold — score >= 2000
+    Gold = 3,
+    /// Platinum — score >= 5000
+    Platinum = 4,
+}
+
+impl ReputationBadge {
+    /// Derive badge from a reputation score.
+    pub fn from_score(score: i128) -> Self {
+        if score >= 5000 {
+            ReputationBadge::Platinum
+        } else if score >= 2000 {
+            ReputationBadge::Gold
+        } else if score >= 500 {
+            ReputationBadge::Silver
+        } else if score >= 100 {
+            ReputationBadge::Bronze
+        } else {
+            ReputationBadge::None
+        }
+    }
+}
+
 /// Represents an incentive offered by a manufacturer to encourage recycling
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

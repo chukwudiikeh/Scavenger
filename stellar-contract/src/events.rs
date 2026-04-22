@@ -115,3 +115,12 @@ pub fn emit_contract_paused(env: &Env, admin: &Address) {
 pub fn emit_contract_unpaused(env: &Env, admin: &Address) {
     env.events().publish((symbol_short!("unpaused"),), admin);
 }
+
+/// Emit event when a participant's reputation score changes.
+/// `delta` is the signed change applied; `new_score` is the resulting score.
+pub fn emit_reputation_changed(env: &Env, participant: &Address, delta: i128, new_score: i128) {
+    env.events().publish(
+        (symbol_short!("rep_chg"), participant),
+        (delta, new_score),
+    );
+}

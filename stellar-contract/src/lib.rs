@@ -8,8 +8,8 @@ mod test_transfer_path_validation;
 
 pub use errors::Error;
 pub use types::{
-    GlobalMetrics, Incentive, Material, ParticipantRole, RecyclingStats, TransferItemType,
-    TransferRecord, TransferStatus, Waste, WasteTransfer, WasteType,
+    GlobalMetrics, Incentive, Material, ParticipantRole, RecyclingStats, ReputationBadge,
+    TransferItemType, TransferRecord, TransferStatus, Waste, WasteTransfer, WasteType,
 };
 
 use soroban_sdk::{
@@ -27,6 +27,22 @@ const REENTRANCY_GUARD: Symbol = symbol_short!("RE_GUARD");
 const TOKEN_ADDR: Symbol = symbol_short!("TKN_ADDR");
 const PART_INDEX: Symbol = symbol_short!("PART_IDX");
 const PAUSED: Symbol = symbol_short!("PAUSED");
+
+// ── Reputation constants ──────────────────────────────────────────────────────
+const REP_MIN: i128 = -1000;
+const REP_MAX: i128 = 10_000;
+/// Points awarded for a verified waste submission
+const REP_VERIFY: i128 = 10;
+/// Points awarded for a successful waste transfer
+const REP_TRANSFER: i128 = 5;
+/// Points awarded for confirming waste details
+const REP_CONFIRM: i128 = 3;
+/// Points deducted for a rejected/failed action
+const REP_PENALTY: i128 = -15;
+/// Seconds in 30 days — inactivity window for decay
+const DECAY_WINDOW_SECS: u64 = 30 * 24 * 3600;
+/// Decay amount applied per inactive window
+const DECAY_AMOUNT: i128 = 10;
 
 /// Maximum allowed waste weight per submission (1 000 000 kg in grams).
 const MAX_WASTE_WEIGHT: u128 = 1_000_000_000;
@@ -68,6 +84,10 @@ pub struct Participant {
     pub total_tokens_earned: u128,
     /// Ledger timestamp at registration.
     pub registered_at: u64,
+    /// Reputation score in range [-1000, 10000].
+    pub reputation_score: i128,
+    /// Ledger timestamp of last activity (for decay).
+    pub last_active_at: u64,
 }
 
 /// Combined view of a participant and their recycling statistics.
@@ -648,6 +668,8 @@ impl ScavengerContract {
             total_waste_processed: 0,
             total_tokens_earned: 0,
             registered_at: env.ledger().timestamp(),
+            reputation_score: 0,
+            last_active_at: env.ledger().timestamp(),
         };
 
         // Store participant using helper function
@@ -1804,8 +1826,12 @@ impl ScavengerContract {
 
         env.events().publish(
             (soroban_sdk::symbol_short!("transfer"), waste_id),
-            (from, to, timestamp),
+            (from.clone(), to.clone(), timestamp),
         );
+
+        // Reputation: reward both parties for a successful transfer
+        Self::apply_reputation(&env, &from, REP_TRANSFER);
+        Self::apply_reputation(&env, &to, REP_TRANSFER);
 
         Ok(transfer)
     }
@@ -2100,6 +2126,11 @@ impl ScavengerContract {
             .set(&("waste_v2", waste_id), &waste);
 
         events::emit_waste_confirmed(&env, waste_id, &confirmer);
+
+        // Reputation: reward confirmer for timely confirmation
+        Self::apply_reputation(&env, &confirmer, REP_CONFIRM);
+        // Reputation: reward owner for having waste confirmed
+        Self::apply_reputation(&env, &waste.current_owner, REP_CONFIRM);
 
         waste
     }
@@ -2402,6 +2433,9 @@ impl ScavengerContract {
 
         // Distribute token rewards using the helper which also emits TOKENS_REWARDED events
         Self::_reward_tokens(&env, material_id, tokens_earned as u128);
+
+        // Reputation: reward submitter for verified waste
+        Self::apply_reputation(&env, &material.submitter, REP_VERIFY);
 
         material
     }
@@ -2713,6 +2747,96 @@ impl ScavengerContract {
         Self::set_incentive(&env, incentive_id, &incentive);
 
         incentive
+    }
+
+    // ========== Reputation Functions ==========
+
+    /// Apply a reputation delta to a participant, clamping to [REP_MIN, REP_MAX].
+    /// Also applies time-based decay for inactivity and updates `last_active_at`.
+    fn apply_reputation(env: &Env, address: &Address, delta: i128) {
+        let key = (address.clone(),);
+        let mut p: Participant = match env.storage().instance().get(&key) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Apply decay for inactivity before adding delta
+        let now = env.ledger().timestamp();
+        if now > p.last_active_at {
+            let elapsed = now - p.last_active_at;
+            let windows = (elapsed / DECAY_WINDOW_SECS) as i128;
+            if windows > 0 && p.reputation_score > 0 {
+                let decay = windows * DECAY_AMOUNT;
+                p.reputation_score = (p.reputation_score - decay).max(0);
+            }
+        }
+
+        let new_score = (p.reputation_score + delta).clamp(REP_MIN, REP_MAX);
+        let actual_delta = new_score - p.reputation_score;
+        p.reputation_score = new_score;
+        p.last_active_at = now;
+        env.storage().instance().set(&key, &p);
+
+        events::emit_reputation_changed(env, address, actual_delta, new_score);
+    }
+
+    /// Get the reputation badge for a participant.
+    ///
+    /// # Returns
+    /// [`ReputationBadge`] derived from the participant's current score.
+    /// Returns `ReputationBadge::None` if the participant is not found.
+    pub fn get_reputation_badge(env: Env, address: Address) -> ReputationBadge {
+        let key = (address,);
+        if let Some(p) = env.storage().instance().get::<_, Participant>(&key) {
+            ReputationBadge::from_score(p.reputation_score)
+        } else {
+            ReputationBadge::None
+        }
+    }
+
+    /// Get all registered participant addresses whose reputation score >= `min_score`.
+    ///
+    /// # Returns
+    /// `Vec<Address>` of matching participants in index order.
+    pub fn get_participants_by_reputation(env: Env, min_score: i128) -> Vec<Address> {
+        let index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&PART_INDEX)
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        for addr in index.iter() {
+            let key = (addr.clone(),);
+            if let Some(p) = env.storage().instance().get::<_, Participant>(&key) {
+                if p.is_registered && p.reputation_score >= min_score {
+                    result.push_back(addr);
+                }
+            }
+        }
+        result
+    }
+
+    /// Manually apply a reputation penalty to a participant (admin only).
+    ///
+    /// Useful for dispute resolution. `delta` must be negative.
+    ///
+    /// # Errors
+    /// - Panics `"Delta must be negative for a penalty"`.
+    pub fn penalize_reputation(env: Env, admin: Address, participant: Address, delta: i128) {
+        Self::only_admin(&env, &admin);
+        if delta >= 0 {
+            panic!("Delta must be negative for a penalty");
+        }
+        Self::apply_reputation(&env, &participant, delta);
+    }
+
+    /// Trigger decay for a participant without changing their score by a delta.
+    /// Useful for off-chain cron-style calls to keep scores fresh.
+    pub fn decay_reputation(env: Env, participant: Address) {
+        Self::require_not_paused(&env);
+        // Apply zero delta — decay logic runs inside apply_reputation
+        Self::apply_reputation(&env, &participant, 0);
     }
 
     // ========== Global Metrics ==========
