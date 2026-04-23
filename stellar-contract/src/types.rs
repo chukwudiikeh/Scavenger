@@ -507,11 +507,20 @@ pub struct Waste {
     pub is_confirmed: bool,
     /// Address of the confirmer/verifier
     pub confirmer: Address,
+    /// Quality grade assigned by a collector or manufacturer
+    pub grade: WasteGrade,
+    /// Category tags for filtering (max 10, each max 20 chars, lowercase)
+    pub tags: soroban_sdk::Vec<soroban_sdk::String>,
+    /// Optional IPFS CID for the primary image (starts with "Qm" or "bafy")
+    pub image_hash: Option<soroban_sdk::String>,
+    /// Supporting document hashes (max 5, each a valid IPFS CID)
+    pub document_hashes: soroban_sdk::Vec<soroban_sdk::String>,
 }
 
 impl Waste {
     /// Creates a new Waste instance with all fields
     pub fn new(
+        env: &soroban_sdk::Env,
         waste_id: u128,
         waste_type: WasteType,
         weight: u128,
@@ -534,6 +543,10 @@ impl Waste {
             is_active,
             is_confirmed,
             confirmer,
+            grade: WasteGrade::C,
+            tags: soroban_sdk::Vec::new(env),
+            image_hash: None,
+            document_hashes: soroban_sdk::Vec::new(env),
         }
     }
 
@@ -640,6 +653,7 @@ pub struct WasteBuilder {
     is_active: bool,
     is_confirmed: bool,
     confirmer: Option<Address>,
+    grade: WasteGrade,
 }
 
 impl WasteBuilder {
@@ -661,6 +675,7 @@ impl WasteBuilder {
             is_active: true,
             is_confirmed: false,
             confirmer: Some(current_owner),
+            grade: WasteGrade::C,
         }
     }
 
@@ -696,8 +711,14 @@ impl WasteBuilder {
         self
     }
 
+    /// Sets the waste grade
+    pub fn grade(mut self, grade: WasteGrade) -> Self {
+        self.grade = grade;
+        self
+    }
+
     /// Builds the Waste instance
-    pub fn build(self) -> Waste {
+    pub fn build(self, env: &soroban_sdk::Env) -> Waste {
         let confirmer = self.confirmer.unwrap_or_else(|| self.current_owner.clone());
         Waste {
             waste_id: self.waste_id,
@@ -710,6 +731,10 @@ impl WasteBuilder {
             is_active: self.is_active,
             is_confirmed: self.is_confirmed,
             confirmer,
+            grade: self.grade,
+            tags: soroban_sdk::Vec::new(env),
+            image_hash: None,
+            document_hashes: soroban_sdk::Vec::new(env),
         }
     }
 }
@@ -735,6 +760,11 @@ pub struct RecyclingStats {
     pub plastic_count: u64,
     pub metal_count: u64,
     pub glass_count: u64,
+    /// Number of wastes graded by this participant per grade
+    pub grade_a_count: u64,
+    pub grade_b_count: u64,
+    pub grade_c_count: u64,
+    pub grade_d_count: u64,
 }
 
 impl RecyclingStats {
@@ -751,6 +781,20 @@ impl RecyclingStats {
             plastic_count: 0,
             metal_count: 0,
             glass_count: 0,
+            grade_a_count: 0,
+            grade_b_count: 0,
+            grade_c_count: 0,
+            grade_d_count: 0,
+        }
+    }
+
+    /// Records a grading action by this participant
+    pub fn record_grade(&mut self, grade: WasteGrade) {
+        match grade {
+            WasteGrade::A => self.grade_a_count += 1,
+            WasteGrade::B => self.grade_b_count += 1,
+            WasteGrade::C => self.grade_c_count += 1,
+            WasteGrade::D => self.grade_d_count += 1,
         }
     }
 
@@ -1313,6 +1357,56 @@ mod tests {
         assert_ne!(ParticipantRole::Recycler, ParticipantRole::Collector);
         assert_ne!(ParticipantRole::Collector, ParticipantRole::Manufacturer);
     }
+}
+
+/// Quality grade for a waste item
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasteGrade {
+    /// Grade A — excellent quality, 1.5x reward multiplier (scaled: 150)
+    A = 0,
+    /// Grade B — good quality, 1.2x reward multiplier (scaled: 120)
+    B = 1,
+    /// Grade C — average quality, 1.0x reward multiplier (scaled: 100)
+    C = 2,
+    /// Grade D — poor quality, 0.7x reward multiplier (scaled: 70)
+    D = 3,
+}
+
+impl WasteGrade {
+    /// Returns the reward multiplier scaled by 100 (e.g. 150 = 1.5x).
+    pub fn multiplier_pct(&self) -> u64 {
+        match self {
+            WasteGrade::A => 150,
+            WasteGrade::B => 120,
+            WasteGrade::C => 100,
+            WasteGrade::D => 70,
+        }
+    }
+
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(WasteGrade::A),
+            1 => Some(WasteGrade::B),
+            2 => Some(WasteGrade::C),
+            3 => Some(WasteGrade::D),
+            _ => None,
+        }
+    }
+
+    pub fn is_valid(v: u32) -> bool {
+        v <= 3
+    }
+}
+
+/// Immutable audit record for a single grading event
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GradeRecord {
+    pub waste_id: u128,
+    pub grade: WasteGrade,
+    pub grader: Address,
+    pub graded_at: u64,
 }
 
 /// Global contract metrics

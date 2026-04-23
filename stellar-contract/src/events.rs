@@ -1,6 +1,6 @@
 use soroban_sdk::{symbol_short, Address, Env, Symbol};
 
-use crate::types::{ParticipantRole, WasteType};
+use crate::types::{ParticipantRole, WasteGrade, WasteType};
 
 const WASTE_REGISTERED: Symbol = symbol_short!("recycled");
 const DONATION_MADE: Symbol = symbol_short!("donated");
@@ -114,4 +114,33 @@ pub fn emit_contract_paused(env: &Env, admin: &Address) {
 
 pub fn emit_contract_unpaused(env: &Env, admin: &Address) {
     env.events().publish((symbol_short!("unpaused"),), admin);
+}
+
+/// Emit event when a waste item is graded
+pub fn emit_waste_graded(env: &Env, waste_id: u128, grade: WasteGrade, grader: &Address) {
+    env.events().publish(
+        (symbol_short!("graded"), waste_id),
+        (grade as u32, grader),
+    );
+}
+
+pub fn emit_proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
+    env.events().publish(
+        (symbol_short!("prop_new"), proposal_id),
+        proposer,
+    );
+}
+
+pub fn emit_proposal_approved(env: &Env, proposal_id: u64, approver: &Address) {
+    env.events().publish(
+        (symbol_short!("prop_apr"), proposal_id),
+        approver,
+    );
+}
+
+pub fn emit_proposal_executed(env: &Env, proposal_id: u64, executor: &Address) {
+    env.events().publish(
+        (symbol_short!("prop_exe"), proposal_id),
+        executor,
+    );
 }

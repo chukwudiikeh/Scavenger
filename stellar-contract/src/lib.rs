@@ -8,8 +8,8 @@ mod test_transfer_path_validation;
 
 pub use errors::Error;
 pub use types::{
-    GlobalMetrics, Incentive, Material, ParticipantRole, RecyclingStats, TransferItemType,
-    TransferRecord, TransferStatus, Waste, WasteTransfer, WasteType,
+    GlobalMetrics, GradeRecord, Incentive, Material, ParticipantRole, RecyclingStats,
+    TransferItemType, TransferRecord, TransferStatus, Waste, WasteGrade, WasteTransfer, WasteType,
 };
 
 use soroban_sdk::{
@@ -27,6 +27,32 @@ const REENTRANCY_GUARD: Symbol = symbol_short!("RE_GUARD");
 const TOKEN_ADDR: Symbol = symbol_short!("TKN_ADDR");
 const PART_INDEX: Symbol = symbol_short!("PART_IDX");
 const PAUSED: Symbol = symbol_short!("PAUSED");
+const MULTISIG_THRESHOLD: Symbol = symbol_short!("MS_THRESH");
+const PROPOSAL_COUNT: Symbol = symbol_short!("PROP_CNT");
+
+/// 7 days in seconds
+const PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Actions that require multi-sig approval.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminAction {
+    TransferAdmin(Vec<Address>),
+    SetPercentages(u32, u32),
+    DeactivateWaste(u128),
+}
+
+/// A pending multi-sig proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposal {
+    pub id: u64,
+    pub action: AdminAction,
+    pub proposer: Address,
+    pub approvers: Vec<Address>,
+    pub executed: bool,
+    pub created_at: u64,
+}
 
 /// Maximum allowed waste weight per submission (1 000 000 kg in grams).
 const MAX_WASTE_WEIGHT: u128 = 1_000_000_000;
@@ -1638,6 +1664,7 @@ impl ScavengerContract {
         let timestamp = env.ledger().timestamp();
 
         let waste = types::Waste::new(
+            &env,
             waste_id,
             waste_type,
             weight,
@@ -1998,6 +2025,7 @@ impl ScavengerContract {
         let timestamp = env.ledger().timestamp();
 
         let waste = types::Waste::new(
+            &env,
             waste_id,
             waste_type,
             0,
@@ -2713,6 +2741,425 @@ impl ScavengerContract {
         Self::set_incentive(&env, incentive_id, &incentive);
 
         incentive
+    }
+
+    // ========== Waste Quality Grading ==========
+
+    /// Assign a quality grade to a v2 waste item.
+    /// Only registered `Collector` or `Manufacturer` participants may grade.
+    pub fn set_waste_grade(env: Env, waste_id: u128, grade: WasteGrade, grader: Address) -> types::Waste {
+        Self::require_not_paused(&env);
+        grader.require_auth();
+        Self::require_registered(&env, &grader);
+
+        let grader_key = (grader.clone(),);
+        let grader_participant: Participant = env
+            .storage()
+            .instance()
+            .get(&grader_key)
+            .expect("Caller is not a registered participant");
+
+        if grader_participant.role == ParticipantRole::Recycler {
+            panic!("Only collectors or manufacturers can grade waste");
+        }
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .expect("Waste not found");
+
+        if !waste.is_active {
+            panic!("Waste is deactivated");
+        }
+
+        waste.grade = grade;
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+
+        let history_key = ("grade_history", waste_id);
+        let mut history: Vec<types::GradeRecord> = env
+            .storage()
+            .instance()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+        history.push_back(types::GradeRecord {
+            waste_id,
+            grade,
+            grader: grader.clone(),
+            graded_at: env.ledger().timestamp(),
+        });
+        env.storage().instance().set(&history_key, &history);
+
+        let stats_key = ("stats", grader.clone());
+        let mut stats: RecyclingStats = env
+            .storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or_else(|| RecyclingStats::new(grader.clone()));
+        stats.record_grade(grade);
+        env.storage().instance().set(&stats_key, &stats);
+
+        events::emit_waste_graded(&env, waste_id, grade, &grader);
+
+        waste
+    }
+
+    /// Get the full grade history for a waste item.
+    pub fn get_grade_history(env: Env, waste_id: u128) -> Vec<types::GradeRecord> {
+        env.storage()
+            .instance()
+            .get(&("grade_history", waste_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get all active v2 waste IDs with a specific grade.
+    pub fn get_wastes_by_grade(env: Env, grade: WasteGrade) -> Vec<u128> {
+        let mut result = Vec::new(&env);
+        let count = Self::get_waste_count(&env);
+        for waste_id in 1..=count {
+            if let Some(waste) = env
+                .storage()
+                .instance()
+                .get::<_, types::Waste>(&("waste_v2", waste_id as u128))
+            {
+                if waste.is_active && waste.grade == grade {
+                    result.push_back(waste_id as u128);
+                }
+            }
+        }
+        result
+    }
+
+    /// Apply the grade multiplier to a base reward: `base * grade.multiplier_pct() / 100`.
+    pub fn apply_grade_multiplier(base_reward: u64, grade: WasteGrade) -> u64 {
+        base_reward * grade.multiplier_pct() / 100
+    }
+
+    // ========== Waste Category Tags ==========
+
+    const MAX_TAGS: u32 = 10;
+    const MAX_TAG_LEN: u32 = 20;
+
+    /// Normalise a tag: validate length, lowercase ASCII bytes, return new String.
+    fn normalise_tag(env: &Env, tag: &String) -> String {
+        let len = tag.len();
+        if len == 0 {
+            panic!("Tag cannot be empty");
+        }
+        if len > Self::MAX_TAG_LEN {
+            panic!("Tag exceeds maximum length of 20 characters");
+        }
+        let mut buf = [0u8; 20];
+        tag.copy_into_slice(&mut buf[..len as usize]);
+        for b in buf[..len as usize].iter_mut() {
+            if *b >= b'A' && *b <= b'Z' {
+                *b += 32;
+            }
+        }
+        String::from_bytes(env, &buf[..len as usize])
+    }
+
+    /// Add a tag to a v2 waste item. Tags are normalised to lowercase. Duplicates ignored.
+    /// Max 10 tags; max 20 chars each. Only the current owner may add tags.
+    pub fn add_waste_tag(env: Env, waste_id: u128, tag: String, caller: Address) -> types::Waste {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        Self::require_registered(&env, &caller);
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .expect("Waste not found");
+
+        if !waste.is_active {
+            panic!("Waste is deactivated");
+        }
+        if waste.current_owner != caller {
+            panic!("Only the waste owner can add tags");
+        }
+        if waste.tags.len() >= Self::MAX_TAGS {
+            panic!("Tag limit reached");
+        }
+
+        let normalised = Self::normalise_tag(&env, &tag);
+        for existing in waste.tags.iter() {
+            if existing == normalised {
+                return waste;
+            }
+        }
+
+        waste.tags.push_back(normalised);
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+        waste
+    }
+
+    /// Remove a tag from a v2 waste item. Case-insensitive. No-op if absent.
+    /// Only the current owner may remove tags.
+    pub fn remove_waste_tag(env: Env, waste_id: u128, tag: String, caller: Address) -> types::Waste {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        Self::require_registered(&env, &caller);
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .expect("Waste not found");
+
+        if waste.current_owner != caller {
+            panic!("Only the waste owner can remove tags");
+        }
+
+        let normalised = Self::normalise_tag(&env, &tag);
+        let mut new_tags: Vec<String> = Vec::new(&env);
+        for existing in waste.tags.iter() {
+            if existing != normalised {
+                new_tags.push_back(existing);
+            }
+        }
+        waste.tags = new_tags;
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+        waste
+    }
+
+    /// Get all active v2 waste IDs that have a specific tag (case-insensitive).
+    pub fn get_wastes_by_tag(env: Env, tag: String) -> Vec<u128> {
+        let normalised = Self::normalise_tag(&env, &tag);
+        let mut result = Vec::new(&env);
+        let count = Self::get_waste_count(&env);
+        for waste_id in 1..=count {
+            if let Some(waste) = env
+                .storage()
+                .instance()
+                .get::<_, types::Waste>(&("waste_v2", waste_id as u128))
+            {
+                if waste.is_active {
+                    for t in waste.tags.iter() {
+                        if t == normalised {
+                            result.push_back(waste_id as u128);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    // ========== Waste Image / Document Hashes ==========
+
+    const MAX_DOCUMENT_HASHES: u32 = 5;
+
+    /// Validate that `hash` is a plausible IPFS CID (starts with "Qm" or "bafy").
+    fn validate_ipfs_hash(env: &Env, hash: &String) {
+        let len = hash.len() as usize;
+        if len < 4 || len > 128 {
+            panic!("Invalid IPFS hash");
+        }
+        let mut buf = [0u8; 128];
+        hash.copy_into_slice(&mut buf[..len]);
+        let starts_qm   = buf[0] == b'Q' && buf[1] == b'm';
+        let starts_bafy = buf[0] == b'b' && buf[1] == b'a' && buf[2] == b'f' && buf[3] == b'y';
+        if !starts_qm && !starts_bafy {
+            panic!("Invalid IPFS hash");
+        }
+        let _ = env;
+    }
+
+    /// Set (or replace) the primary image hash for a v2 waste item. Owner only.
+    pub fn set_waste_image(env: Env, waste_id: u128, hash: String, caller: Address) -> types::Waste {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        Self::require_registered(&env, &caller);
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .expect("Waste not found");
+
+        if !waste.is_active {
+            panic!("Waste is deactivated");
+        }
+        if waste.current_owner != caller {
+            panic!("Only the waste owner can set image hash");
+        }
+
+        Self::validate_ipfs_hash(&env, &hash);
+        waste.image_hash = Some(hash);
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+        waste
+    }
+
+    /// Add a document hash to a v2 waste item (max 5). Owner only.
+    pub fn add_waste_document(env: Env, waste_id: u128, hash: String, caller: Address) -> types::Waste {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        Self::require_registered(&env, &caller);
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .expect("Waste not found");
+
+        if !waste.is_active {
+            panic!("Waste is deactivated");
+        }
+        if waste.current_owner != caller {
+            panic!("Only the waste owner can add document hashes");
+        }
+        if waste.document_hashes.len() >= Self::MAX_DOCUMENT_HASHES {
+            panic!("Document hash limit reached");
+        }
+
+        Self::validate_ipfs_hash(&env, &hash);
+        waste.document_hashes.push_back(hash);
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+        waste
+    }
+
+    // ========== Multi-Signature Admin Operations ==========
+
+    /// Set the number of admin approvals required to execute a proposal (1 ≤ threshold ≤ admin count).
+    pub fn set_multisig_threshold(env: Env, admin: Address, threshold: u32) {
+        Self::require_admin(&env, &admin);
+        let admins: Vec<Address> = env.storage().instance().get(&ADMINS).expect("Admin not set");
+        if threshold == 0 || threshold > admins.len() {
+            panic!("Threshold must be between 1 and the number of admins");
+        }
+        env.storage().instance().set(&MULTISIG_THRESHOLD, &threshold);
+    }
+
+    /// Get the current multi-sig threshold (defaults to 1).
+    pub fn get_multisig_threshold(env: Env) -> u32 {
+        env.storage().instance().get(&MULTISIG_THRESHOLD).unwrap_or(1)
+    }
+
+    fn next_proposal_id(env: &Env) -> u64 {
+        let id: u64 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0) + 1;
+        env.storage().instance().set(&PROPOSAL_COUNT, &id);
+        id
+    }
+
+    fn get_proposal(env: &Env, proposal_id: u64) -> AdminProposal {
+        env.storage()
+            .instance()
+            .get(&("proposal", proposal_id))
+            .expect("Proposal not found")
+    }
+
+    fn save_proposal(env: &Env, proposal: &AdminProposal) {
+        env.storage()
+            .instance()
+            .set(&("proposal", proposal.id), proposal);
+    }
+
+    /// Propose a new admin action. The proposer's approval is counted automatically.
+    pub fn propose_admin_action(env: Env, proposer: Address, action: AdminAction) -> AdminProposal {
+        Self::require_admin(&env, &proposer);
+        Self::require_not_paused(&env);
+
+        let id = Self::next_proposal_id(&env);
+        let mut approvers = Vec::new(&env);
+        approvers.push_back(proposer.clone());
+
+        let proposal = AdminProposal {
+            id,
+            action,
+            proposer: proposer.clone(),
+            approvers,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+        };
+
+        Self::save_proposal(&env, &proposal);
+        events::emit_proposal_created(&env, id, &proposer);
+        proposal
+    }
+
+    /// Approve an existing proposal. Each admin may approve at most once.
+    pub fn approve_admin_proposal(env: Env, approver: Address, proposal_id: u64) -> AdminProposal {
+        Self::require_admin(&env, &approver);
+        Self::require_not_paused(&env);
+
+        let mut proposal = Self::get_proposal(&env, proposal_id);
+
+        if proposal.executed {
+            panic!("Proposal already executed");
+        }
+        if env.ledger().timestamp() > proposal.created_at + PROPOSAL_TTL_SECS {
+            panic!("Proposal expired");
+        }
+        if proposal.approvers.contains(&approver) {
+            panic!("Already approved");
+        }
+
+        proposal.approvers.push_back(approver.clone());
+        Self::save_proposal(&env, &proposal);
+        events::emit_proposal_approved(&env, proposal_id, &approver);
+        proposal
+    }
+
+    /// Execute a proposal once the approval threshold is met.
+    pub fn execute_admin_proposal(env: Env, executor: Address, proposal_id: u64) -> AdminProposal {
+        Self::require_admin(&env, &executor);
+        Self::require_not_paused(&env);
+
+        let mut proposal = Self::get_proposal(&env, proposal_id);
+
+        if proposal.executed {
+            panic!("Proposal already executed");
+        }
+        if env.ledger().timestamp() > proposal.created_at + PROPOSAL_TTL_SECS {
+            panic!("Proposal expired");
+        }
+
+        let threshold = Self::get_multisig_threshold(env.clone());
+        if proposal.approvers.len() < threshold {
+            panic!("Insufficient approvals");
+        }
+
+        match proposal.action.clone() {
+            AdminAction::TransferAdmin(new_admins) => {
+                if new_admins.is_empty() {
+                    panic!("Admin list cannot be empty");
+                }
+                env.storage().instance().set(&ADMINS, &new_admins);
+            }
+            AdminAction::SetPercentages(collector_pct, owner_pct) => {
+                if collector_pct + owner_pct > 100 {
+                    panic!("Total percentages cannot exceed 100");
+                }
+                env.storage().instance().set(
+                    &REWARD_CFG,
+                    &RewardConfig { collector_percentage: collector_pct, owner_percentage: owner_pct },
+                );
+            }
+            AdminAction::DeactivateWaste(waste_id) => {
+                let mut waste: types::Waste = env
+                    .storage()
+                    .instance()
+                    .get(&("waste_v2", waste_id))
+                    .expect("Waste item not found");
+                if !waste.is_active {
+                    panic!("Waste already deactivated");
+                }
+                waste.deactivate();
+                env.storage().instance().set(&("waste_v2", waste_id), &waste);
+            }
+        }
+
+        proposal.executed = true;
+        Self::save_proposal(&env, &proposal);
+        events::emit_proposal_executed(&env, proposal_id, &executor);
+        proposal
+    }
+
+    /// Get a proposal by ID.
+    pub fn get_admin_proposal(env: Env, proposal_id: u64) -> AdminProposal {
+        Self::get_proposal(&env, proposal_id)
     }
 
     // ========== Global Metrics ==========
