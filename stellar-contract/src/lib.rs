@@ -12,6 +12,7 @@ pub use types::{
     RecyclingStats, SeasonalMultiplier, TransferItemType, TransferRecord, TransferStatus, Waste,
     WasteTransfer, WasteType,
 };
+pub use types::calculate_carbon_credits;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
@@ -29,6 +30,8 @@ const TOKEN_ADDR: Symbol = symbol_short!("TKN_ADDR");
 const PART_INDEX: Symbol = symbol_short!("PART_IDX");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 const SEASONAL_MUL: Symbol = symbol_short!("SEAS_MUL");
+const TOTAL_CARBON: Symbol = symbol_short!("TOT_CRBN");
+const CONTAMINATED_LIST: Symbol = symbol_short!("CONT_LST");
 
 /// Maximum allowed waste weight per submission (1 000 000 kg in grams).
 const MAX_WASTE_WEIGHT: u128 = 1_000_000_000;
@@ -2587,8 +2590,21 @@ impl ScavengerContract {
         material.verify();
         Self::set_waste(&env, material_id, &material);
 
-        // Calculate tokens earned
-        let tokens_earned = material.calculate_reward_points();
+        // Calculate tokens earned, reduced by contamination if applicable
+        let base_tokens = material.calculate_reward_points();
+        let tokens_earned: u64 = {
+            let v2: Option<types::Waste> = env
+                .storage()
+                .instance()
+                .get(&("waste_v2", material_id as u128));
+            match v2 {
+                Some(w) if w.is_contaminated && w.contamination_level > 50 => 0,
+                Some(w) if w.is_contaminated => {
+                    base_tokens * (100 - w.contamination_level as u64) / 100
+                }
+                _ => base_tokens,
+            }
+        };
 
         // Update submitter stats
         let mut stats: RecyclingStats = env
@@ -2601,6 +2617,14 @@ impl ScavengerContract {
         env.storage()
             .instance()
             .set(&("stats", material.submitter.clone()), &stats);
+
+        // Update global carbon credits counter
+        let credits = types::calculate_carbon_credits(material.waste_type, material.weight as u128);
+        let total_carbon: u128 = env.storage().instance().get(&TOTAL_CARBON).unwrap_or(0);
+        env.storage().instance().set(&TOTAL_CARBON, &(total_carbon + credits));
+
+        // Emit carbon credits earned event
+        events::emit_carbon_credits_earned(&env, &material.submitter, material.waste_type, material.weight as u128, credits);
 
         // Distribute token rewards using the helper which also emits TOKENS_REWARDED events
         Self::_reward_tokens(&env, material_id, tokens_earned as u128);
@@ -2668,6 +2692,14 @@ impl ScavengerContract {
                     .instance()
                     .set(&("stats", material.submitter.clone()), &stats);
 
+                // Update global carbon credits counter
+                let credits = types::calculate_carbon_credits(material.waste_type, material.weight as u128);
+                let total_carbon: u128 = env.storage().instance().get(&TOTAL_CARBON).unwrap_or(0);
+                env.storage().instance().set(&TOTAL_CARBON, &(total_carbon + credits));
+
+                // Emit carbon credits earned event
+                events::emit_carbon_credits_earned(&env, &material.submitter, material.waste_type, material.weight as u128, credits);
+
                 // Distribute token rewards using the helper which also emits TOKENS_REWARDED events
                 Self::_reward_tokens(&env, material_id, tokens_earned as u128);
 
@@ -2685,6 +2717,90 @@ impl ScavengerContract {
     /// at least one material, `None` otherwise.
     pub fn get_stats(env: Env, participant: Address) -> Option<RecyclingStats> {
         env.storage().instance().get(&("stats", participant))
+    }
+
+    /// Calculate carbon credits for a given waste type and weight in grams.
+    /// Returns grams of CO2 equivalent.
+    pub fn calculate_carbon_credits(waste_type: WasteType, weight_grams: u128) -> u128 {
+        types::calculate_carbon_credits(waste_type, weight_grams)
+    }
+
+    /// Get total carbon credits earned across all participants.
+    pub fn get_total_carbon_credits(env: Env) -> u128 {
+        env.storage().instance().get(&TOTAL_CARBON).unwrap_or(0)
+    }
+
+    /// Get carbon credits earned by a specific participant.
+    pub fn get_participant_carbon_credits(env: Env, participant: Address) -> u128 {
+        let stats: Option<RecyclingStats> = env.storage().instance().get(&("stats", participant));
+        stats.map(|s| s.carbon_credits_earned).unwrap_or(0)
+    }
+
+    /// Mark a v2 waste item as contaminated.
+    ///
+    /// Only a registered Recycler (verifier) may call this.
+    /// Contamination level must be 0-100. Reason must not exceed 200 chars.
+    /// Emits a `WasteContaminated` event.
+    pub fn mark_contaminated(
+        env: Env,
+        waste_id: u128,
+        verifier: Address,
+        level: u32,
+        reason: String,
+    ) -> types::Waste {
+        Self::require_not_paused(&env);
+        verifier.require_auth();
+
+        assert!(level <= 100, "Contamination level must be 0-100");
+        assert!(reason.len() <= 200, "Reason exceeds 200 characters");
+
+        let participant: Participant = env
+            .storage()
+            .instance()
+            .get(&(verifier.clone(),))
+            .expect("Verifier not registered");
+
+        assert!(participant.is_registered, "Verifier is not registered");
+        assert!(
+            participant.role.can_process_recyclables(),
+            "Only recyclers can mark contamination"
+        );
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .expect("Waste not found");
+
+        waste.is_contaminated = true;
+        waste.contamination_level = level;
+        waste.contamination_reason = reason;
+
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+
+        // Append to contaminated list
+        let mut list: Vec<u128> = env
+            .storage()
+            .instance()
+            .get(&CONTAMINATED_LIST)
+            .unwrap_or(Vec::new(&env));
+        // Only add once
+        if !list.contains(&waste_id) {
+            list.push_back(waste_id);
+            env.storage().instance().set(&CONTAMINATED_LIST, &list);
+        }
+
+        events::emit_waste_contaminated(&env, waste_id, &verifier, level);
+
+        waste
+    }
+
+    /// Return all v2 waste IDs that have been marked as contaminated.
+    pub fn get_contaminated_wastes(env: Env) -> Vec<u128> {
+        env.storage()
+            .instance()
+            .get(&CONTAMINATED_LIST)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Get global supply-chain statistics.
@@ -2931,9 +3047,15 @@ impl ScavengerContract {
             .instance()
             .get(&TOTAL_TOKENS)
             .unwrap_or(0);
+        let total_carbon_credits: u128 = env
+            .storage()
+            .instance()
+            .get(&TOTAL_CARBON)
+            .unwrap_or(0);
         types::GlobalMetrics {
             total_wastes_count,
             total_tokens_earned,
+            total_carbon_credits,
         }
     }
 
@@ -2990,7 +3112,22 @@ impl ScavengerContract {
         let weight_kg = material.weight / 1000;
         let base_reward = (incentive.reward_points as i128) * (weight_kg as i128);
         let multiplier = Self::get_current_multiplier(env.clone()) as i128;
-        let total_reward = (base_reward * multiplier) / 100;
+        let mut total_reward = (base_reward * multiplier) / 100;
+
+        // Apply contamination reduction if a v2 waste record exists for this ID
+        let v2_waste: Option<types::Waste> = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id as u128));
+        if let Some(w) = v2_waste {
+            if w.is_contaminated {
+                if w.contamination_level > 50 {
+                    total_reward = 0;
+                } else {
+                    total_reward = total_reward * (100 - w.contamination_level as i128) / 100;
+                }
+            }
+        }
         assert!(
             (total_reward as u64) <= incentive.remaining_budget,
             "Insufficient incentive budget"
