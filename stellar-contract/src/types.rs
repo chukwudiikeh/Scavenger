@@ -215,6 +215,10 @@ pub struct Incentive {
     pub active: bool,
     /// Timestamp when the incentive was created
     pub created_at: u64,
+    /// Optional UTC timestamp when the incentive becomes active
+    pub starts_at: Option<u64>,
+    /// Optional UTC timestamp when the incentive expires
+    pub ends_at: Option<u64>,
 }
 
 impl Incentive {
@@ -236,6 +240,8 @@ impl Incentive {
             remaining_budget: total_budget,
             active: true,
             created_at,
+            starts_at: None,
+            ends_at: None,
         }
     }
 
@@ -507,6 +513,12 @@ pub struct Waste {
     pub is_confirmed: bool,
     /// Address of the confirmer/verifier
     pub confirmer: Address,
+    /// Address that has reserved this waste item (None if unreserved)
+    pub reserved_by: Option<Address>,
+    /// Ledger timestamp at which the reservation expires (None if unreserved)
+    pub reserved_until: Option<u64>,
+    /// Expiration timestamp (0 = no expiry). Set from per-type TTL at registration time.
+    pub expires_at: u64,
 }
 
 impl Waste {
@@ -522,6 +534,7 @@ impl Waste {
         is_active: bool,
         is_confirmed: bool,
         confirmer: Address,
+        expires_at: u64,
     ) -> Self {
         Self {
             waste_id,
@@ -534,7 +547,15 @@ impl Waste {
             is_active,
             is_confirmed,
             confirmer,
+            reserved_by: None,
+            reserved_until: None,
+            expires_at,
         }
+    }
+
+    /// Returns true if the waste has expired at the given timestamp.
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expires_at != 0 && now >= self.expires_at
     }
 
     /// Validates that the waste has valid coordinates
@@ -640,6 +661,7 @@ pub struct WasteBuilder {
     is_active: bool,
     is_confirmed: bool,
     confirmer: Option<Address>,
+    expires_at: u64,
 }
 
 impl WasteBuilder {
@@ -661,6 +683,7 @@ impl WasteBuilder {
             is_active: true,
             is_confirmed: false,
             confirmer: Some(current_owner),
+            expires_at: 0,
         }
     }
 
@@ -710,6 +733,9 @@ impl WasteBuilder {
             is_active: self.is_active,
             is_confirmed: self.is_confirmed,
             confirmer,
+            reserved_by: None,
+            reserved_until: None,
+            expires_at: self.expires_at,
         }
     }
 }
