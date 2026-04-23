@@ -1129,12 +1129,8 @@ impl ScavengerContract {
             return 0;
         }
 
-        // Calculate reward: (weight in kg) * reward_points
-        let weight_kg = waste_amount / 1000;
-        let reward = weight_kg * incentive.reward_points;
-        
-        // Exact reward calculation instead of capping
-        reward
+        // Use tiered or flat reward calculation
+        incentive.calculate_reward(waste_amount)
     }
 
     /// Get all active incentives for a specific waste type, sorted by reward descending.
@@ -2917,6 +2913,7 @@ impl ScavengerContract {
             reward_points,
             total_budget,
             env.ledger().timestamp(),
+            &env,
         );
 
         // Store incentive
@@ -3033,209 +3030,86 @@ impl ScavengerContract {
         incentive
     }
 
-    // ========== Collection Routes ==========
-
-    fn next_route_id(env: &Env) -> u64 {
-        let count: u64 = env.storage().instance().get(&ROUTE_CNT).unwrap_or(0);
-        let next = count + 1;
-        env.storage().instance().set(&ROUTE_CNT, &next);
-        next
-    }
-
-    /// Haversine distance in km between two points given in microdegrees (1e-6 °).
-    /// Uses integer arithmetic only — no floating point.
+    /// Set tiered reward structure for an incentive (max 5 tiers).
     ///
-    /// Accuracy is sufficient for route-grouping purposes (< 0.5 % error).
-    fn haversine_km(lat1: i128, lon1: i128, lat2: i128, lon2: i128) -> u64 {
-        // Convert microdegrees → millidegrees (÷1000) to keep numbers manageable
-        // then work in units of 1e-3 degrees throughout.
-        // Earth radius ≈ 6371 km.
-        // We use a small-angle / flat-earth approximation for distances < ~500 km
-        // which is accurate enough for waste collection routing.
-        //
-        // Δlat and Δlon in microdegrees
-        let dlat = (lat2 - lat1).abs(); // microdegrees
-        let dlon = (lon2 - lon1).abs(); // microdegrees
-
-        // 1 degree latitude ≈ 111.32 km → 1 microdegree ≈ 0.00011132 km
-        // Scale: multiply by 11132 then divide by 1e8 to get km (avoids floats)
-        let dlat_km = (dlat * 11132) / 100_000_000i128; // km
-
-        // For longitude, scale by cos(lat) ≈ approximate with lat/90 correction
-        // Use mid-latitude cosine approximation: cos(lat°) ≈ 1 - (lat/90)²/2
-        // For simplicity use cos ≈ (90_000_000 - |lat_mid|) / 90_000_000
-        let lat_mid = (lat1 + lat2) / 2;
-        let lat_mid_abs = lat_mid.abs();
-        let cos_scale = if lat_mid_abs >= 90_000_000 {
-            0i128
-        } else {
-            90_000_000 - lat_mid_abs
-        };
-        let dlon_km = (dlon * 11132 * cos_scale) / (100_000_000i128 * 90_000_000i128);
-
-        // Euclidean distance in km (integer sqrt approximation)
-        let dist_sq = dlat_km * dlat_km + dlon_km * dlon_km;
-        // Integer square root via Newton's method
-        if dist_sq == 0 {
-            return 0;
-        }
-        let mut x = dist_sq;
-        let mut y = (x + 1) / 2;
-        while y < x {
-            x = y;
-            y = (x + dist_sq / x) / 2;
-        }
-        x as u64
-    }
-
-    /// Return all active v2 waste IDs within `radius_km` of the given coordinates.
+    /// Tiers must be sorted by `min_weight_kg` ascending, non-overlapping,
+    /// and contiguous (each tier's `min_weight_kg` must equal the previous
+    /// tier's `max_weight_kg`). Only the original `rewarder` may call this.
     ///
-    /// Coordinates are in microdegrees (e.g. 40_000_000 = 40.0°).
-    /// Uses the Haversine formula for distance calculation.
+    /// # Parameters
+    /// - `incentive_id`: ID of the incentive to update.
+    /// - `rewarder`: Original creator. Must sign.
+    /// - `tiers`: Vec of up to 5 [`IncentiveTier`] entries.
     ///
     /// # Returns
-    /// `Vec<u128>` of waste IDs within the radius, in storage order.
-    pub fn get_wastes_in_radius(
+    /// The updated [`Incentive`].
+    ///
+    /// # Errors
+    /// - Panics `"Incentive not found"`.
+    /// - Panics `"Only incentive creator can set tiers"`.
+    /// - Panics `"Incentive is not active"`.
+    /// - Panics `"Maximum 5 tiers allowed"`.
+    /// - Panics `"Tiers cannot be empty"`.
+    /// - Panics `"Tier reward_points must be greater than zero"`.
+    /// - Panics `"Tiers must be sorted by min_weight_kg ascending"`.
+    /// - Panics `"Tier ranges must not overlap"`.
+    /// - Panics `"Last tier must be unbounded (max_weight_kg == 0)"`.
+    pub fn set_incentive_tiers(
         env: Env,
-        lat: i128,
-        lon: i128,
-        radius_km: u64,
-    ) -> Vec<u128> {
-        let total = Self::get_waste_count(&env);
-        let mut result = Vec::new(&env);
-        for waste_id in 1..=total {
-            if let Some(waste) = env
-                .storage()
-                .instance()
-                .get::<_, types::Waste>(&("waste_v2", waste_id as u128))
-            {
-                if waste.is_active {
-                    let dist = Self::haversine_km(lat, lon, waste.latitude, waste.longitude);
-                    if dist <= radius_km {
-                        result.push_back(waste_id as u128);
-                    }
+        incentive_id: u64,
+        rewarder: Address,
+        tiers: soroban_sdk::Vec<IncentiveTier>,
+    ) -> Incentive {
+        Self::require_not_paused(&env);
+        rewarder.require_auth();
+        Self::require_registered(&env, &rewarder);
+
+        let mut incentive =
+            Self::get_incentive_internal(&env, incentive_id).expect("Incentive not found");
+
+        if incentive.rewarder != rewarder {
+            panic!("Only incentive creator can set tiers");
+        }
+        if !incentive.active {
+            panic!("Incentive is not active");
+        }
+        if tiers.is_empty() {
+            panic!("Tiers cannot be empty");
+        }
+        if tiers.len() > 5 {
+            panic!("Maximum 5 tiers allowed");
+        }
+
+        // Validate each tier and ordering
+        let mut prev_max: u64 = 0;
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if tier.reward_points == 0 {
+                panic!("Tier reward_points must be greater than zero");
+            }
+            if tier.min_weight_kg < prev_max {
+                panic!("Tier ranges must not overlap");
+            }
+            if tier.min_weight_kg != prev_max {
+                panic!("Tiers must be sorted by min_weight_kg ascending");
+            }
+            // Last tier must be unbounded
+            if i == tiers.len() - 1 && tier.max_weight_kg != 0 {
+                panic!("Last tier must be unbounded (max_weight_kg == 0)");
+            }
+            // Non-last tiers must have max > min
+            if i < tiers.len() - 1 {
+                if tier.max_weight_kg == 0 || tier.max_weight_kg <= tier.min_weight_kg {
+                    panic!("Tier ranges must not overlap");
                 }
-            }
-        }
-        result
-    }
-
-    /// Create a collection route for a set of waste items.
-    ///
-    /// Only registered `Collector` participants may create routes.
-    /// All waste IDs must exist and be active. Max 50 wastes per route.
-    ///
-    /// # Parameters
-    /// - `collector`: Registered Collector. Must sign.
-    /// - `waste_ids`: Ordered list of v2 waste IDs to collect (max 50).
-    ///
-    /// # Returns
-    /// The newly created [`CollectionRoute`].
-    ///
-    /// # Errors
-    /// - Panics `"Only collectors can create routes"`.
-    /// - Panics `"Route must contain at least one waste item"`.
-    /// - Panics `"Route cannot exceed 50 waste items"`.
-    /// - Panics `"Waste not found or inactive"` for any invalid waste ID.
-    pub fn create_collection_route(
-        env: Env,
-        collector: Address,
-        waste_ids: Vec<u128>,
-    ) -> CollectionRoute {
-        Self::require_not_paused(&env);
-        collector.require_auth();
-        Self::require_registered(&env, &collector);
-
-        let key = (collector.clone(),);
-        let participant: Participant = env
-            .storage()
-            .instance()
-            .get(&key)
-            .expect("Participant not found");
-        if !matches!(participant.role, ParticipantRole::Collector) {
-            panic!("Only collectors can create routes");
-        }
-
-        if waste_ids.is_empty() {
-            panic!("Route must contain at least one waste item");
-        }
-        if waste_ids.len() > 50 {
-            panic!("Route cannot exceed 50 waste items");
-        }
-
-        // Validate all waste IDs
-        for waste_id in waste_ids.iter() {
-            let waste: Option<types::Waste> = env
-                .storage()
-                .instance()
-                .get(&("waste_v2", waste_id));
-            match waste {
-                Some(w) if w.is_active => {}
-                _ => panic!("Waste not found or inactive"),
+                prev_max = tier.max_weight_kg;
             }
         }
 
-        let route_id = Self::next_route_id(&env);
-        let route = CollectionRoute {
-            id: route_id,
-            collector: collector.clone(),
-            waste_ids: waste_ids.clone(),
-            status: RouteStatus::Pending,
-            created_at: env.ledger().timestamp(),
-        };
+        incentive.tiers = tiers;
+        Self::set_incentive(&env, incentive_id, &incentive);
 
-        env.storage()
-            .instance()
-            .set(&("route", route_id), &route);
-
-        events::emit_route_created(&env, route_id, &collector, waste_ids.len());
-
-        route
-    }
-
-    /// Mark a collection route as completed.
-    ///
-    /// Only the assigned collector may complete their own route.
-    ///
-    /// # Parameters
-    /// - `collector`: Assigned collector. Must sign.
-    /// - `route_id`: ID of the route to complete.
-    ///
-    /// # Returns
-    /// The updated [`CollectionRoute`] with `status = Completed`.
-    ///
-    /// # Errors
-    /// - Panics `"Route not found"`.
-    /// - Panics `"Route is not pending"`.
-    /// - Panics `"Only the assigned collector can complete this route"`.
-    pub fn complete_route(env: Env, collector: Address, route_id: u64) -> CollectionRoute {
-        Self::require_not_paused(&env);
-        collector.require_auth();
-
-        let mut route: CollectionRoute = env
-            .storage()
-            .instance()
-            .get(&("route", route_id))
-            .expect("Route not found");
-
-        if route.collector != collector {
-            panic!("Only the assigned collector can complete this route");
-        }
-        if route.status != RouteStatus::Pending {
-            panic!("Route is not pending");
-        }
-
-        route.status = RouteStatus::Completed;
-        env.storage().instance().set(&("route", route_id), &route);
-
-        events::emit_route_completed(&env, route_id, &collector);
-
-        route
-    }
-
-    /// Retrieve a collection route by ID.
-    pub fn get_route(env: Env, route_id: u64) -> Option<CollectionRoute> {
-        env.storage().instance().get(&("route", route_id))
+        incentive
     }
 
     // ========== Global Metrics ==========
@@ -3340,8 +3214,6 @@ impl ScavengerContract {
 
         let transfers = Self::get_transfer_history(env.clone(), waste_id);
         let cfg = Self::get_reward_config(&env);
-        let collector_pct: u32 = cfg.collector_percentage;
-        let owner_pct: u32 = cfg.owner_percentage;
         let collector_pct = cfg.collector_percentage;
         let owner_pct = cfg.owner_percentage;
 
