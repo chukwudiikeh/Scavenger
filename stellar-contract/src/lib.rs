@@ -8,7 +8,7 @@ mod validation;
 
 pub use errors::Error;
 pub use types::{
-    Challenge, ChallengeProgress, ChallengeStatus, GlobalMetrics, GradeRecord, Incentive,
+    Challenge, ChallengeProgress, ChallengeStatus, CertificationLevel, GlobalMetrics, GradeRecord, Auction, Incentive,
     LeaderboardEntry, Material, Milestone, ParticipantRole, PendingTransfer,
     PendingTransferStatus, ProcessingRecord, ProcessingStatus, RecyclingStats, SeasonalMultiplier,
     TransferItemType, TransferRecord, TransferStatus, Waste, WasteGrade, WasteTransfer, WasteType,
@@ -36,6 +36,7 @@ const PROPOSAL_COUNT: Symbol = symbol_short!("PROP_CNT");
 const CHALLENGE_COUNT: Symbol = symbol_short!("CHAL_CNT");
 const PENDING_XFR_CNT: Symbol = symbol_short!("PXFR_CNT");
 const MILESTONES_KEY: Symbol = symbol_short!("MLSTONES");
+const AUCTION_COUNT: Symbol = symbol_short!("AUC_CNT");
 
 // Pre-existing missing constants
 const SEASONAL_MUL: Symbol = symbol_short!("SEAS_MUL");
@@ -55,6 +56,15 @@ const TRANSFER_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
 /// Max active challenges
 const MAX_ACTIVE_CHALLENGES: u32 = 10;
+
+/// Min auction duration: 1 hour in seconds
+const MIN_AUCTION_DURATION: u64 = 60 * 60;
+
+/// Max auction duration: 7 days in seconds
+const MAX_AUCTION_DURATION: u64 = 7 * 24 * 60 * 60;
+
+/// Min bid increment: 5%
+const MIN_BID_INCREMENT_PERCENT: u128 = 5;
 
 /// Predefined milestone thresholds in grams
 const MILESTONE_THRESHOLDS: [u128; 7] = [
@@ -132,6 +142,8 @@ pub struct Participant {
     pub reputation_score: i128,
     /// Ledger timestamp of last activity (for decay).
     pub last_active_at: u64,
+    /// Certification level based on activity and accuracy
+    pub certification: CertificationLevel,
 }
 
 /// Combined view of a participant and their recycling statistics.
@@ -771,6 +783,7 @@ impl ScavengerContract {
             registered_at: env.ledger().timestamp(),
             reputation_score: 0,
             last_active_at: env.ledger().timestamp(),
+            certification: CertificationLevel::Beginner,
         };
 
         // Store participant using helper function
@@ -821,7 +834,16 @@ impl ScavengerContract {
                 .checked_add(tokens_earned as u128)
                 .expect("Overflow in total_tokens_earned");
 
+            // Update certification based on waste processed
+            let old_certification = participant.certification;
+            participant.certification = CertificationLevel::from_waste_count(participant.total_waste_processed);
+
             env.storage().instance().set(&key, &participant);
+
+            // Emit certification granted event if level upgraded
+            if participant.certification != old_certification {
+                events::emit_certification_granted(env, address, participant.certification);
+            }
 
             // Update global total tokens if tokens were earned
             if tokens_earned > 0 {
@@ -856,9 +878,12 @@ impl ScavengerContract {
             let participant: Option<Participant> = env.storage().instance().get(&key);
             if let Some(p) = participant {
                 if matches!(p.role, ParticipantRole::Collector) {
-                    total_distributed += collector_share;
-                    Self::update_participant_stats(env, &transfer.to, 0, collector_share as u64);
-                    events::emit_tokens_rewarded(env, &transfer.to, collector_share, waste_id);
+                    let base_share = collector_share;
+                    let multiplier = p.certification.reward_multiplier() as u128;
+                    let share = (base_share * multiplier) / 100;
+                    total_distributed += share;
+                    Self::update_participant_stats(env, &transfer.to, 0, share as u64);
+                    events::emit_tokens_rewarded(env, &transfer.to, share, waste_id);
                 }
             }
         }
@@ -871,27 +896,32 @@ impl ScavengerContract {
 
             if submitter_total > 0 {
                 let key = (material.submitter.clone(),);
-                if let Some(mut participant) = env.storage().instance().get::<_, Participant>(&key)
-                {
+                if let Some(participant) = env.storage().instance().get::<_, Participant>(&key) {
+                    let multiplier = participant.certification.reward_multiplier() as u128;
+                    let adjusted_total = (submitter_total * multiplier) / 100;
+
+                    let mut participant = participant; // make mutable
                     participant.total_tokens_earned = participant
                         .total_tokens_earned
-                        .checked_add(submitter_total)
+                        .checked_add(adjusted_total)
                         .expect("Overflow in total_tokens_earned");
                     env.storage().instance().set(&key, &participant);
-                }
 
-                // Single global-tokens update for the submitter's combined share
-                Self::add_to_total_tokens(env, submitter_total);
+                    // Single global-tokens update for the submitter's combined share
+                    Self::add_to_total_tokens(env, adjusted_total);
 
-                // Emit two events to preserve existing behaviour / test expectations
-                events::emit_tokens_rewarded(env, &material.submitter, owner_share, waste_id);
-                if recycler_amount > 0 {
-                    events::emit_tokens_rewarded(
-                        env,
-                        &material.submitter,
-                        recycler_amount,
-                        waste_id,
-                    );
+                    // Emit two events to preserve existing behaviour / test expectations
+                    let adjusted_owner_share = (owner_share * multiplier) / 100;
+                    let adjusted_recycler_amount = (recycler_amount * multiplier) / 100;
+                    events::emit_tokens_rewarded(env, &material.submitter, adjusted_owner_share, waste_id);
+                    if adjusted_recycler_amount > 0 {
+                        events::emit_tokens_rewarded(
+                            env,
+                            &material.submitter,
+                            adjusted_recycler_amount,
+                            waste_id,
+                        );
+                    }
                 }
             }
         }
@@ -1360,6 +1390,305 @@ impl ScavengerContract {
         result
     }
 
+    /// Grant certification to a participant (admin only)
+    ///
+    /// # Parameters
+    /// - `address`: Participant's address
+    /// - `level`: Certification level to grant
+    ///
+    /// # Errors
+    /// - Panics if caller is not admin
+    /// - Panics if participant not found
+    pub fn grant_certification(env: Env, address: Address, level: CertificationLevel) {
+        Self::require_admin(&env);
+
+        let key = (address.clone(),);
+        if let Some(mut participant) = env.storage().instance().get::<_, Participant>(&key) {
+            let old_level = participant.certification;
+            participant.certification = level;
+            env.storage().instance().set(&key, &participant);
+
+            // Emit event if level changed
+            if level != old_level {
+                events::emit_certification_granted(&env, &address, level);
+            }
+        } else {
+            panic!("Participant not found");
+        }
+    }
+
+    /// Get participants by certification level
+    ///
+    /// # Parameters
+    /// - `level`: Certification level to filter by
+    ///
+    /// # Returns
+    /// Vector of participant addresses with the specified certification level
+    pub fn get_participants_by_certification(env: Env, level: CertificationLevel) -> Vec<Address> {
+        let participant_index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&PART_INDEX)
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+
+        for addr in participant_index {
+            if let Some(participant) = Self::get_participant(env.clone(), addr.clone()) {
+                if participant.certification == level {
+                    result.push_back(addr);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Create a new auction for waste material
+    ///
+    /// # Parameters
+    /// - `waste_id`: ID of the waste to auction
+    /// - `start_price`: Starting price in tokens
+    /// - `duration`: Duration in seconds (1 hour to 7 days)
+    ///
+    /// # Returns
+    /// The created auction ID
+    ///
+    /// # Errors
+    /// - Panics if waste not found or not owned by caller
+    /// - Panics if duration invalid
+    pub fn create_auction(env: Env, waste_id: u128, start_price: u128, duration: u64) -> u64 {
+        Self::require_not_paused(&env);
+
+        // Validate duration
+        if duration < MIN_AUCTION_DURATION || duration > MAX_AUCTION_DURATION {
+            panic!("Invalid auction duration");
+        }
+
+        // Get waste and check ownership
+        let waste = Self::get_waste_by_id(env.clone(), waste_id as u64)
+            .expect("Waste not found");
+        if waste.current_owner != env.invoker() {
+            panic!("Not waste owner");
+        }
+
+        // Transfer waste to contract for auction
+        let mut waste: types::Waste = env.storage().instance().get(&("waste_v2", waste_id)).expect("Waste not found");
+        waste.current_owner = env.current_contract_address();
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+
+        // Get next auction ID
+        let auction_id = env.storage().instance().get(&AUCTION_COUNT).unwrap_or(0u64) + 1;
+        env.storage().instance().set(&AUCTION_COUNT, &auction_id);
+
+        // Create auction
+        let auction = Auction::new(&env, auction_id, waste_id, env.invoker(), start_price, duration);
+        let key = ("auction", auction_id);
+        env.storage().instance().set(&key, &auction);
+
+        // Emit event
+        events::emit_auction_created(&env, auction_id, waste_id, &env.invoker(), start_price, auction.end_time);
+
+        auction_id
+    }
+
+    /// Place a bid on an active auction
+    ///
+    /// # Parameters
+    /// - `auction_id`: ID of the auction
+    /// - `amount`: Bid amount in tokens
+    ///
+    /// # Errors
+    /// - Panics if auction not found or ended
+    /// - Panics if bid too low
+    pub fn place_bid(env: Env, auction_id: u64, amount: u128) {
+        Self::require_not_paused(&env);
+        env.invoker().require_auth();
+
+        let key = ("auction", auction_id);
+        let mut auction: Auction = env.storage().instance().get(&key).expect("Auction not found");
+
+        if !auction.is_active || auction.is_ended(env.ledger().timestamp()) {
+            panic!("Auction not active");
+        }
+
+        if !auction.is_valid_bid(amount) {
+            panic!("Bid too low");
+        }
+
+        // Transfer tokens from bidder to contract (assuming token contract)
+        // For simplicity, assume tokens are handled externally or use internal balance
+
+        auction.place_bid(env.invoker(), amount);
+        env.storage().instance().set(&key, &auction);
+
+        // Emit event
+        events::emit_bid_placed(&env, auction_id, &env.invoker(), amount);
+    }
+
+    /// End an auction and transfer waste to winner
+    ///
+    /// # Parameters
+    /// - `auction_id`: ID of the auction
+    ///
+    /// # Errors
+    /// - Panics if auction not found or not ended
+    pub fn end_auction(env: Env, auction_id: u64) {
+        Self::require_not_paused(&env);
+
+        let key = ("auction", auction_id);
+        let mut auction: Auction = env.storage().instance().get(&key).expect("Auction not found");
+
+        if !auction.is_active || !auction.is_ended(env.ledger().timestamp()) {
+            panic!("Auction not ended");
+        }
+
+        auction.end();
+        env.storage().instance().set(&key, &auction);
+
+        // Transfer waste to winner
+        if let Some(winner) = &auction.bidder {
+            let mut waste: types::Waste = env.storage().instance().get(&("waste_v2", auction.waste_id)).expect("Waste not found");
+            waste.current_owner = winner.clone();
+            env.storage().instance().set(&("waste_v2", auction.waste_id), &waste);
+        }
+
+        // Emit event
+        events::emit_auction_ended(&env, auction_id, auction.bidder.as_ref(), auction.current_bid);
+    }
+
+    /// Cancel an auction (owner only)
+    ///
+    /// # Parameters
+    /// - `auction_id`: ID of the auction
+    ///
+    /// # Errors
+    /// - Panics if not owner or auction has bids
+    pub fn cancel_auction(env: Env, auction_id: u64) {
+        Self::require_not_paused(&env);
+        env.invoker().require_auth();
+
+        let key = ("auction", auction_id);
+        let auction: Auction = env.storage().instance().get(&key).expect("Auction not found");
+
+        if auction.creator != env.invoker() {
+            panic!("Not auction creator");
+        }
+
+        if auction.bidder.is_some() {
+            panic!("Cannot cancel auction with bids");
+        }
+
+        // Remove auction
+        env.storage().instance().remove(&key);
+    }
+
+    /// Get waste by tracking code
+    ///
+    /// # Parameters
+    /// - `code`: Tracking code to search for
+    ///
+    /// # Returns
+    /// Waste item if found
+    pub fn get_waste_by_tracking_code(env: Env, code: soroban_sdk::String) -> Option<types::Waste> {
+        // This is inefficient, but for demo purposes
+        // In production, would need a map from tracking_code to waste_id
+        let participant_index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&PART_INDEX)
+            .unwrap_or(Vec::new(&env));
+
+        for addr in participant_index {
+            if let Some(waste_list) = env.storage().instance().get::<_, Vec<u128>>(&("participant_wastes", addr)) {
+                for waste_id in waste_list {
+                    if let Some(waste) = env.storage().instance().get::<_, types::Waste>(&("waste_v2", waste_id)) {
+                        if waste.tracking_code == code {
+                            return Some(waste);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Bulk import historical waste data (admin only)
+    ///
+    /// # Parameters
+    /// - `wastes`: Vector of waste data to import
+    ///
+    /// # Errors
+    /// - Panics if not admin
+    /// - Panics if batch too large
+    pub fn bulk_import_wastes(env: Env, wastes: soroban_sdk::Vec<types::Waste>) {
+        Self::require_admin(&env);
+
+        if wastes.len() > 100 {
+            panic!("Batch too large");
+        }
+
+        // Validate all data
+        for waste in wastes.iter() {
+            if waste.weight == 0 {
+                panic!("Invalid waste data");
+            }
+            // Add more validations as needed
+        }
+
+        // Import
+        for waste in wastes.iter() {
+            env.storage().instance().set(&("waste_v2", waste.waste_id), &waste);
+            // Update participant wastes list if needed
+        }
+
+        // Emit event
+        events::emit_bulk_import_completed(&env, "waste", wastes.len() as u32);
+    }
+
+    /// Bulk import historical participant data (admin only)
+    ///
+    /// # Parameters
+    /// - `participants`: Vector of participant data to import
+    ///
+    /// # Errors
+    /// - Panics if not admin
+    /// - Panics if batch too large
+    pub fn bulk_import_participants(env: Env, participants: soroban_sdk::Vec<Participant>) {
+        Self::require_admin(&env);
+
+        if participants.len() > 100 {
+            panic!("Batch too large");
+        }
+
+        // Validate all data
+        for participant in participants.iter() {
+            if !participant.is_registered {
+                panic!("Invalid participant data");
+            }
+            // Add more validations as needed
+        }
+
+        // Import
+        for participant in participants.iter() {
+            let key = (participant.address.clone(),);
+            env.storage().instance().set(&key, &participant);
+            // Add to index
+            let mut participant_index: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&PART_INDEX)
+                .unwrap_or(Vec::new(&env));
+            if !participant_index.contains(&participant.address) {
+                participant_index.push_back(participant.address.clone());
+                env.storage().instance().set(&PART_INDEX, &participant_index);
+            }
+        }
+
+        // Emit event
+        events::emit_bulk_import_completed(&env, "participant", participants.len() as u32);
+    }
+
     /// Update participant role
     /// Preserves registration timestamp and other data
     /// Change the role of a registered participant.
@@ -1801,6 +2130,17 @@ impl ScavengerContract {
             .instance()
             .set(&("participant_wastes", recycler.clone()), &waste_list);
 
+        // Track total weight in stats for recycling rate calculation
+        let stats_key = ("stats", recycler.clone());
+        let mut stats: RecyclingStats = env
+            .storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or_else(|| RecyclingStats::new(recycler.clone()));
+        stats.total_weight = stats.total_weight.saturating_add(weight as u64);
+        stats.update_recycling_rate();
+        env.storage().instance().set(&stats_key, &stats);
+
         // Emit waste registered event
         events::emit_waste_registered(
             &env, waste_id, &recycler, waste_type, weight, latitude, longitude,
@@ -1868,6 +2208,48 @@ impl ScavengerContract {
 
         env.storage().instance().set(&("waste_v2", waste_id), &waste);
         events::emit_processing_status_changed(&env, waste_id, new_status.to_u32(), &caller, timestamp);
+
+        // When waste reaches Recycled status, update stats and goals
+        if new_status == ProcessingStatus::Recycled {
+            let owner = waste.current_owner.clone();
+            let stats_key = ("stats", owner.clone());
+            let mut stats: RecyclingStats = env
+                .storage()
+                .instance()
+                .get(&stats_key)
+                .unwrap_or_else(|| RecyclingStats::new(owner.clone()));
+            stats.recycled_weight = stats.recycled_weight.saturating_add(waste.weight);
+            stats.update_recycling_rate();
+            env.storage().instance().set(&stats_key, &stats);
+
+            // Update goals progress
+            let goals_key = ("goals", owner.clone());
+            let mut goals: Vec<types::RecyclingGoal> = env
+                .storage()
+                .instance()
+                .get(&goals_key)
+                .unwrap_or(Vec::new(&env));
+            let mut goals_updated = false;
+            for i in 0..goals.len() {
+                let mut goal = goals.get(i).unwrap();
+                if goal.achieved {
+                    continue;
+                }
+                let type_matches = goal.waste_type.map_or(true, |t| t == waste.waste_type);
+                if type_matches {
+                    goal.current_weight = goal.current_weight.saturating_add(waste.weight);
+                    if goal.current_weight >= goal.target_weight {
+                        goal.achieved = true;
+                        events::emit_goal_achieved(&env, &owner, goal.target_weight);
+                    }
+                    goals.set(i, goal);
+                    goals_updated = true;
+                }
+            }
+            if goals_updated {
+                env.storage().instance().set(&goals_key, &goals);
+            }
+        }
 
         waste
     }
@@ -5042,5 +5424,301 @@ impl ScavengerContract {
         events::emit_incentive_scheduled(&env, incentive_id, &rewarder, starts_at, ends_at);
 
         Ok(incentive)
+    }
+
+    // ========== Feature: Processing Costs Tracking ==========
+
+    /// Set the processing cost for a v2 waste item.
+    ///
+    /// Only the current owner may call this.
+    ///
+    /// # Errors
+    /// - [`Error::WasteNotFound`] if the waste does not exist.
+    /// - [`Error::NotWasteOwner`] if caller is not the current owner.
+    pub fn set_processing_cost(
+        env: Env,
+        waste_id: u128,
+        owner: Address,
+        cost: u128,
+    ) -> Result<types::Waste, Error> {
+        owner.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .ok_or(Error::WasteNotFound)?;
+
+        if waste.current_owner != owner {
+            return Err(Error::NotWasteOwner);
+        }
+
+        waste.processing_cost = cost;
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+
+        // Update participant stats
+        let stats_key = ("stats", owner.clone());
+        let mut stats: RecyclingStats = env
+            .storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or_else(|| RecyclingStats::new(owner.clone()));
+        stats.total_processing_costs = stats.total_processing_costs.saturating_add(cost);
+        env.storage().instance().set(&stats_key, &stats);
+
+        Ok(waste)
+    }
+
+    /// Get the total processing costs across all v2 waste items.
+    pub fn get_total_processing_costs(env: Env) -> u128 {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&("waste_count",))
+            .unwrap_or(0);
+        let mut total: u128 = 0;
+        for id in 1u128..=(count as u128) {
+            if let Some(w) = env
+                .storage()
+                .instance()
+                .get::<_, types::Waste>(&("waste_v2", id))
+            {
+                total = total.saturating_add(w.processing_cost);
+            }
+        }
+        total
+    }
+
+    /// Get the total processing costs for a specific participant.
+    pub fn get_participant_processing_costs(env: Env, participant: Address) -> u128 {
+        let stats: Option<RecyclingStats> = env.storage().instance().get(&("stats", participant));
+        stats.map(|s| s.total_processing_costs).unwrap_or(0)
+    }
+
+    // ========== Feature: Material Composition Tracking ==========
+
+    /// Set the material composition for a v2 waste item.
+    ///
+    /// Only a registered Collector or Manufacturer (verifier) may call this.
+    /// Percentages must sum to exactly 100. Maximum 10 composition entries.
+    ///
+    /// # Errors
+    /// - [`Error::WasteNotFound`] if the waste does not exist.
+    /// - [`Error::NotRegistered`] if caller is not registered.
+    /// - [`Error::InvalidAmount`] if percentages don't sum to 100 or > 10 entries.
+    pub fn set_waste_composition(
+        env: Env,
+        waste_id: u128,
+        verifier: Address,
+        composition: Vec<types::MaterialComposition>,
+    ) -> Result<types::Waste, Error> {
+        verifier.require_auth();
+        Self::require_not_paused(&env);
+
+        // Verifier must be a registered Collector or Manufacturer
+        let participant = Self::get_participant(env.clone(), verifier.clone())
+            .ok_or(Error::NotRegistered)?;
+        if participant.role == ParticipantRole::Recycler {
+            return Err(Error::Unauthorized);
+        }
+
+        if composition.len() > 10 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let mut total: u32 = 0;
+        for entry in composition.iter() {
+            total = total.saturating_add(entry.percentage);
+        }
+        if total != 100 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let mut waste: types::Waste = env
+            .storage()
+            .instance()
+            .get(&("waste_v2", waste_id))
+            .ok_or(Error::WasteNotFound)?;
+
+        waste.composition = composition;
+        env.storage().instance().set(&("waste_v2", waste_id), &waste);
+
+        Ok(waste)
+    }
+
+    /// Get all v2 waste IDs that contain at least `min_percentage` of `material_type`.
+    pub fn get_wastes_by_composition(
+        env: Env,
+        material_type: WasteType,
+        min_percentage: u32,
+    ) -> Vec<u128> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&("waste_count",))
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        for id in 1u128..=(count as u128) {
+            if let Some(w) = env
+                .storage()
+                .instance()
+                .get::<_, types::Waste>(&("waste_v2", id))
+            {
+                for entry in w.composition.iter() {
+                    if entry.material_type == material_type && entry.percentage >= min_percentage {
+                        result.push_back(id);
+                        break;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    // ========== Feature: Recycling Goals ==========
+
+    /// Set a recycling goal for the caller.
+    ///
+    /// Maximum 5 active goals per participant.
+    /// Goal duration must be between 1 and 12 months from now (approx 30–365 days).
+    ///
+    /// # Errors
+    /// - [`Error::NotRegistered`] if caller is not registered.
+    /// - [`Error::InvalidAmount`] if target_weight is 0, too many goals, or invalid duration.
+    pub fn set_recycling_goal(
+        env: Env,
+        participant: Address,
+        target_weight: u128,
+        target_date: u64,
+        waste_type: Option<WasteType>,
+    ) -> Result<(), Error> {
+        participant.require_auth();
+        Self::require_not_paused(&env);
+
+        if Self::get_participant(env.clone(), participant.clone()).is_none() {
+            return Err(Error::NotRegistered);
+        }
+
+        if target_weight == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let one_month_secs: u64 = 30 * 24 * 60 * 60;
+        let twelve_months_secs: u64 = 365 * 24 * 60 * 60;
+
+        if target_date < now + one_month_secs || target_date > now + twelve_months_secs {
+            return Err(Error::InvalidAmount);
+        }
+
+        let goals_key = ("goals", participant.clone());
+        let mut goals: Vec<types::RecyclingGoal> = env
+            .storage()
+            .instance()
+            .get(&goals_key)
+            .unwrap_or(Vec::new(&env));
+
+        // Count active (non-achieved) goals
+        let mut active_count: u32 = 0;
+        for goal in goals.iter() {
+            if !goal.achieved {
+                active_count += 1;
+            }
+        }
+        if active_count >= 5 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let goal = types::RecyclingGoal {
+            target_weight,
+            target_date,
+            waste_type,
+            current_weight: 0,
+            achieved: false,
+            created_at: now,
+        };
+
+        goals.push_back(goal);
+        env.storage().instance().set(&goals_key, &goals);
+
+        env.events().publish(
+            (symbol_short!("goal_set"), participant.clone()),
+            (target_weight, target_date),
+        );
+
+        Ok(())
+    }
+
+    /// Get the recycling goals and progress for a participant.
+    pub fn get_goal_progress(env: Env, participant: Address) -> Vec<types::RecyclingGoal> {
+        env.storage()
+            .instance()
+            .get(&("goals", participant))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get all participants who have at least one achieved goal.
+    pub fn get_participants_meeting_goals(env: Env) -> Vec<Address> {
+        let index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&PART_INDEX)
+            .unwrap_or(Vec::new(&env));
+        let mut result = Vec::new(&env);
+        for addr in index.iter() {
+            let goals: Vec<types::RecyclingGoal> = env
+                .storage()
+                .instance()
+                .get(&("goals", addr.clone()))
+                .unwrap_or(Vec::new(&env));
+            let mut has_achieved = false;
+            for goal in goals.iter() {
+                if goal.achieved {
+                    has_achieved = true;
+                    break;
+                }
+            }
+            if has_achieved {
+                result.push_back(addr);
+            }
+        }
+        result
+    }
+
+    // ========== Feature: Recycling Rate Calculations ==========
+
+    /// Get the global recycling rate in basis points (e.g. 9500 = 95.00%).
+    /// Calculated as (total recycled weight / total weight) * 10000.
+    pub fn get_global_recycling_rate(env: Env) -> u32 {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&("waste_count",))
+            .unwrap_or(0);
+        let mut total_weight: u128 = 0;
+        let mut recycled_weight: u128 = 0;
+        for id in 1u128..=(count as u128) {
+            if let Some(w) = env
+                .storage()
+                .instance()
+                .get::<_, types::Waste>(&("waste_v2", id))
+            {
+                total_weight = total_weight.saturating_add(w.weight);
+                if w.recycled_timestamp > 0 {
+                    recycled_weight = recycled_weight.saturating_add(w.weight);
+                }
+            }
+        }
+        if total_weight == 0 {
+            return 0;
+        }
+        ((recycled_weight * 10_000) / total_weight) as u32
+    }
+
+    /// Get the recycling rate for a specific participant in basis points.
+    pub fn get_participant_recycling_rate(env: Env, participant: Address) -> u32 {
+        let stats: Option<RecyclingStats> = env.storage().instance().get(&("stats", participant));
+        stats.map(|s| s.recycling_rate).unwrap_or(0)
     }
 }

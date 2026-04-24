@@ -380,6 +380,83 @@ impl ParticipantRole {
     }
 }
 
+/// Represents the certification level of a participant based on activity and accuracy
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CertificationLevel {
+    /// Beginner: 0-10 wastes processed
+    Beginner = 0,
+    /// Intermediate: 11-50 wastes processed
+    Intermediate = 1,
+    /// Advanced: 51-200 wastes processed
+    Advanced = 2,
+    /// Expert: 201+ wastes processed
+    Expert = 3,
+}
+
+impl CertificationLevel {
+    /// Validates if the level is a valid CertificationLevel variant
+    pub fn is_valid(level: u32) -> bool {
+        matches!(level, 0..=3)
+    }
+
+    /// Converts a u32 to a CertificationLevel
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(CertificationLevel::Beginner),
+            1 => Some(CertificationLevel::Intermediate),
+            2 => Some(CertificationLevel::Advanced),
+            3 => Some(CertificationLevel::Expert),
+            _ => None,
+        }
+    }
+
+    /// Converts the CertificationLevel to u32
+    pub fn to_u32(&self) -> u32 {
+        *self as u32
+    }
+
+    /// Returns the string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CertificationLevel::Beginner => "BEGINNER",
+            CertificationLevel::Intermediate => "INTERMEDIATE",
+            CertificationLevel::Advanced => "ADVANCED",
+            CertificationLevel::Expert => "EXPERT",
+        }
+    }
+
+    /// Determines certification level based on waste count
+    pub fn from_waste_count(waste_count: u128) -> Self {
+        match waste_count {
+            0..=10 => CertificationLevel::Beginner,
+            11..=50 => CertificationLevel::Intermediate,
+            51..=200 => CertificationLevel::Advanced,
+            _ => CertificationLevel::Expert,
+        }
+    }
+
+    /// Gets the minimum waste count for this level
+    pub fn min_waste_count(&self) -> u128 {
+        match self {
+            CertificationLevel::Beginner => 0,
+            CertificationLevel::Intermediate => 11,
+            CertificationLevel::Advanced => 51,
+            CertificationLevel::Expert => 201,
+        }
+    }
+
+    /// Gets the reward multiplier for this certification level
+    pub fn reward_multiplier(&self) -> u64 {
+        match self {
+            CertificationLevel::Beginner => 100, // 1.0x
+            CertificationLevel::Intermediate => 110, // 1.1x
+            CertificationLevel::Advanced => 125, // 1.25x
+            CertificationLevel::Expert => 150, // 1.5x
+        }
+    }
+}
+
 /// Represents the type of waste material in the recycling ecosystem
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -583,6 +660,35 @@ pub struct ProcessingRecord {
     pub updated_by: Address,
 }
 
+/// Represents a single material component in a waste item's composition.
+/// Percentages across all entries for a waste item must sum to 100.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterialComposition {
+    /// The type of material in this component
+    pub material_type: WasteType,
+    /// Percentage of this material (0-100, all entries must sum to 100)
+    pub percentage: u32,
+}
+
+/// Represents a participant's recycling goal
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecyclingGoal {
+    /// Target weight in grams
+    pub target_weight: u128,
+    /// Target completion timestamp (Unix seconds)
+    pub target_date: u64,
+    /// Waste type this goal applies to (None = any type)
+    pub waste_type: Option<WasteType>,
+    /// Weight already recycled toward this goal
+    pub current_weight: u128,
+    /// Whether this goal has been achieved
+    pub achieved: bool,
+    /// Timestamp when goal was created
+    pub created_at: u64,
+}
+
 /// Represents a waste item in the recycling system
 /// This is the main struct that tracks waste throughout its lifecycle
 #[contracttype]
@@ -632,6 +738,8 @@ pub struct Waste {
     pub processing_status: ProcessingStatus,
     /// Processing history
     pub processing_history: soroban_sdk::Vec<ProcessingRecord>,
+    /// Unique tracking code for QR codes
+    pub tracking_code: soroban_sdk::String,
 }
 
 impl Waste {
@@ -658,6 +766,11 @@ impl Waste {
         };
         let mut history = soroban_sdk::Vec::new(env);
         history.push_back(initial_record);
+
+        // Generate tracking code: WS-{waste_id}-{checksum}
+        let checksum = (waste_id % 10000) as u32;
+        let tracking_code = soroban_sdk::String::from_str(env, &format!("WS-{:09}-{:04}", waste_id, checksum));
+
         Self {
             waste_id,
             waste_type,
@@ -681,10 +794,9 @@ impl Waste {
             contamination_reason: soroban_sdk::String::from_str(env, ""),
             processing_status: ProcessingStatus::Collected,
             processing_history: history,
+            tracking_code,
         }
     }
-
-    /// Returns true if the waste has expired at the given timestamp.
     pub fn is_expired(&self, now: u64) -> bool {
         self.expires_at != 0 && now >= self.expires_at
     }
@@ -741,6 +853,83 @@ impl Waste {
     pub fn update_location(&mut self, latitude: i128, longitude: i128) {
         self.latitude = latitude;
         self.longitude = longitude;
+    }
+}
+
+/// Represents an auction for waste materials
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Auction {
+    /// Unique identifier for the auction
+    pub id: u64,
+    /// ID of the waste being auctioned
+    pub waste_id: u128,
+    /// Address of the auction creator (waste owner)
+    pub creator: Address,
+    /// Starting price in tokens
+    pub start_price: u128,
+    /// Current highest bid
+    pub current_bid: u128,
+    /// Address of the current highest bidder
+    pub bidder: Option<Address>,
+    /// Timestamp when the auction ends
+    pub end_time: u64,
+    /// Whether the auction is active
+    pub is_active: bool,
+    /// List of all bidders for refund purposes
+    pub bidders: soroban_sdk::Vec<Address>,
+}
+
+impl Auction {
+    /// Creates a new auction
+    pub fn new(
+        env: &soroban_sdk::Env,
+        id: u64,
+        waste_id: u128,
+        creator: Address,
+        start_price: u128,
+        duration: u64,
+    ) -> Self {
+        let end_time = env.ledger().timestamp() + duration;
+        Self {
+            id,
+            waste_id,
+            creator,
+            start_price,
+            current_bid: start_price,
+            bidder: None,
+            end_time,
+            is_active: true,
+            bidders: soroban_sdk::Vec::new(env),
+        }
+    }
+
+    /// Checks if the auction has ended
+    pub fn is_ended(&self, now: u64) -> bool {
+        now >= self.end_time
+    }
+
+    /// Checks if a bid is valid (higher than current by at least 5%)
+    pub fn is_valid_bid(&self, bid_amount: u128) -> bool {
+        if bid_amount <= self.current_bid {
+            return false;
+        }
+        let min_increment = (self.current_bid * 105) / 100;
+        bid_amount >= min_increment
+    }
+
+    /// Places a bid on the auction
+    pub fn place_bid(&mut self, bidder: Address, amount: u128) {
+        if !self.bidders.contains(&bidder) {
+            self.bidders.push_back(bidder.clone());
+        }
+        self.bidder = Some(bidder);
+        self.current_bid = amount;
+    }
+
+    /// Ends the auction
+    pub fn end(&mut self) {
+        self.is_active = false;
     }
 }
 
@@ -891,6 +1080,8 @@ impl WasteBuilder {
             contamination_reason: soroban_sdk::String::from_str(env, ""),
             processing_status: ProcessingStatus::Collected,
             processing_history: history,
+            processing_cost: 0,
+            composition: soroban_sdk::Vec::new(env),
         }
     }
 }
@@ -924,6 +1115,13 @@ pub struct RecyclingStats {
     pub grade_b_count: u64,
     pub grade_c_count: u64,
     pub grade_d_count: u64,
+    /// Total processing costs incurred (in smallest token unit)
+    pub total_processing_costs: u128,
+    /// Recycling rate in basis points (e.g. 9500 = 95.00%)
+    /// Calculated as (recycled_weight / total_weight) * 10000
+    pub recycling_rate: u32,
+    /// Total weight of recycled waste (for rate calculation)
+    pub recycled_weight: u128,
 }
 
 impl RecyclingStats {
@@ -947,6 +1145,9 @@ impl RecyclingStats {
             grade_b_count: 0,
             grade_c_count: 0,
             grade_d_count: 0,
+            total_processing_costs: 0,
+            recycling_rate: 0,
+            recycled_weight: 0,
         }
     }
 
@@ -1031,6 +1232,16 @@ impl RecyclingStats {
     /// Checks if participant is a verified contributor (80%+ verification rate)
     pub fn is_verified_contributor(&self) -> bool {
         self.verification_rate() >= 80
+    }
+
+    /// Recalculates and stores the recycling rate in basis points.
+    /// rate = (recycled_weight / total_weight) * 10000
+    pub fn update_recycling_rate(&mut self) {
+        self.recycling_rate = if self.total_weight == 0 {
+            0
+        } else {
+            ((self.recycled_weight as u128 * 10_000) / self.total_weight as u128) as u32
+        };
     }
 }
 

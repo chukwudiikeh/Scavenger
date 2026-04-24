@@ -14,8 +14,8 @@ const HomePage = lazy(() => import('@/pages/HomePage').then((m) => ({ default: m
 const RecyclerDashboard = lazy(() =>
   import('@/pages/RecyclerDashboard').then((m) => ({ default: m.RecyclerDashboard }))
 )
-const IncentivesPage = lazy(() =>
-  import('@/pages/IncentivesPage').then((m) => ({ default: m.IncentivesPage }))
+const IncentivesMarketplacePage = lazy(() =>
+  import('@/pages/IncentivesMarketplacePage').then((m) => ({ default: m.IncentivesMarketplacePage }))
 )
 const WasteListPage = lazy(() =>
   import('@/pages/WasteListPage').then((m) => ({ default: m.WasteListPage }))
@@ -78,7 +78,7 @@ export const router = createBrowserRouter([
       { path: 'dashboard', element: <HomePage /> },
       { path: 'submit', element: <div>Submit Waste</div> },
       { path: 'collect', element: <CollectorDashboardPage /> },
-      { path: 'incentives', element: <IncentivesPage /> },
+      { path: 'incentives', element: <IncentivesMarketplacePage /> },
       { path: 'transfer', element: <div>Transfer</div> },
       { path: 'history', element: <div>History</div> },
       { path: 'dashboard/recycler', element: <RecyclerDashboard /> },
