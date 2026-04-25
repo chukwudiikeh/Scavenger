@@ -64,6 +64,12 @@ const WasteComparisonPage = lazy(() =>
 const PredictiveAnalyticsPage = lazy(() =>
   import('@/pages/PredictiveAnalyticsPage').then((m) => ({ default: m.PredictiveAnalyticsPage }))
 )
+const SubscriptionsPage = lazy(() =>
+  import('@/pages/SubscriptionsPage').then((m) => ({ default: m.SubscriptionsPage }))
+)
+const CharityDonationsPage = lazy(() =>
+  import('@/pages/CharityDonationsPage').then((m) => ({ default: m.CharityDonationsPage }))
+)
 
 // eslint-disable-next-line react-refresh/only-export-components
 function PageFallback() {
@@ -113,7 +119,9 @@ export const router = createBrowserRouter([
       { path: 'route-planner', element: <RoutePlannerPage /> },
       { path: 'messages', element: <MessagingPage /> },
       { path: 'compare', element: <WasteComparisonPage /> },
-      { path: 'predictions', element: <PredictiveAnalyticsPage /> }
+      { path: 'predictions', element: <PredictiveAnalyticsPage /> },
+      { path: 'subscriptions', element: <SubscriptionsPage /> },
+      { path: 'charities', element: <CharityDonationsPage /> }
     ]
   },
   { path: '*', element: <NotFoundPage /> }
