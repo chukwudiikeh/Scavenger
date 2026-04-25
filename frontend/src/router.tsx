@@ -64,17 +64,14 @@ const WasteComparisonPage = lazy(() =>
 const PredictiveAnalyticsPage = lazy(() =>
   import('@/pages/PredictiveAnalyticsPage').then((m) => ({ default: m.PredictiveAnalyticsPage }))
 )
-const SubscriptionsPage = lazy(() =>
-  import('@/pages/SubscriptionsPage').then((m) => ({ default: m.SubscriptionsPage }))
+const WasteMarketplacePage = lazy(() =>
+  import('@/pages/WasteMarketplacePage').then((m) => ({ default: m.WasteMarketplacePage }))
 )
-const CharityDonationsPage = lazy(() =>
-  import('@/pages/CharityDonationsPage').then((m) => ({ default: m.CharityDonationsPage }))
+const WasteCertificationPage = lazy(() =>
+  import('@/pages/WasteCertificationPage').then((m) => ({ default: m.WasteCertificationPage }))
 )
-const ImpactCalculatorPage = lazy(() =>
-  import('@/pages/ImpactCalculatorPage').then((m) => ({ default: m.ImpactCalculatorPage }))
-)
-const GamificationPage = lazy(() =>
-  import('@/pages/GamificationPage').then((m) => ({ default: m.GamificationPage }))
+const RecyclingGuidePage = lazy(() =>
+  import('@/pages/RecyclingGuidePage').then((m) => ({ default: m.RecyclingGuidePage }))
 )
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -126,10 +123,9 @@ export const router = createBrowserRouter([
       { path: 'messages', element: <MessagingPage /> },
       { path: 'compare', element: <WasteComparisonPage /> },
       { path: 'predictions', element: <PredictiveAnalyticsPage /> },
-      { path: 'subscriptions', element: <SubscriptionsPage /> },
-      { path: 'charities', element: <CharityDonationsPage /> },
-      { path: 'impact', element: <ImpactCalculatorPage /> },
-      { path: 'achievements', element: <GamificationPage /> }
+      { path: 'marketplace', element: <WasteMarketplacePage /> },
+      { path: 'certifications', element: <WasteCertificationPage /> },
+      { path: 'recycling-guide', element: <RecyclingGuidePage /> }
     ]
   },
   { path: '*', element: <NotFoundPage /> }
