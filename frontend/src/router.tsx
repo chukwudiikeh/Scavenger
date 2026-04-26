@@ -10,15 +10,69 @@ import { LoginPage } from '@/pages/LoginPage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
 
 // Lazy-load all protected pages to reduce initial bundle size
-const HomePage                  = lazy(() => import('@/pages/HomePage').then((m) => ({ default: m.HomePage })))
-const RecyclerDashboard         = lazy(() => import('@/pages/RecyclerDashboard').then((m) => ({ default: m.RecyclerDashboard })))
-const IncentivesPage            = lazy(() => import('@/pages/IncentivesPage').then((m) => ({ default: m.IncentivesPage })))
-const WasteListPage             = lazy(() => import('@/pages/WasteListPage').then((m) => ({ default: m.WasteListPage })))
-const ManufacturerDashboardPage = lazy(() => import('@/pages/ManufacturerDashboardPage').then((m) => ({ default: m.ManufacturerDashboardPage })))
-const CollectorDashboardPage    = lazy(() => import('@/pages/CollectorDashboardPage').then((m) => ({ default: m.CollectorDashboardPage })))
-const SettingsPage              = lazy(() => import('@/pages/SettingsPage').then((m) => ({ default: m.SettingsPage })))
-const RewardsPage               = lazy(() => import('@/pages/RewardsPage').then((m) => ({ default: m.RewardsPage })))
-const SupplyChainTrackerPage    = lazy(() => import('@/pages/SupplyChainTrackerPage').then((m) => ({ default: m.SupplyChainTrackerPage })))
+const HomePage = lazy(() => import('@/pages/HomePage').then((m) => ({ default: m.HomePage })))
+const RecyclerDashboard = lazy(() =>
+  import('@/pages/RecyclerDashboard').then((m) => ({ default: m.RecyclerDashboard }))
+)
+const IncentivesMarketplacePage = lazy(() =>
+  import('@/pages/IncentivesMarketplacePage').then((m) => ({ default: m.IncentivesMarketplacePage }))
+)
+const WasteListPage = lazy(() =>
+  import('@/pages/WasteListPage').then((m) => ({ default: m.WasteListPage }))
+)
+const ManufacturerDashboardPage = lazy(() =>
+  import('@/pages/ManufacturerDashboardPage').then((m) => ({
+    default: m.ManufacturerDashboardPage
+  }))
+)
+const CollectorDashboardPage = lazy(() =>
+  import('@/pages/CollectorDashboardPage').then((m) => ({ default: m.CollectorDashboardPage }))
+)
+const SettingsPage = lazy(() =>
+  import('@/pages/SettingsPage').then((m) => ({ default: m.SettingsPage }))
+)
+const RewardsPage = lazy(() =>
+  import('@/pages/RewardsPage').then((m) => ({ default: m.RewardsPage }))
+)
+const SupplyChainTrackerPage = lazy(() =>
+  import('@/pages/SupplyChainTrackerPage').then((m) => ({ default: m.SupplyChainTrackerPage }))
+)
+const CommunityPage = lazy(() =>
+  import('@/pages/CommunityPage').then((m) => ({ default: m.CommunityPage }))
+)
+const AnalyticsPage = lazy(() =>
+  import('@/pages/AnalyticsPage').then((m) => ({ default: m.AnalyticsPage }))
+)
+const WasteMapPage = lazy(() =>
+  import('@/pages/WasteMapPage').then((m) => ({ default: m.WasteMapPage }))
+)
+const AdminDashboardPage = lazy(() =>
+  import('@/pages/AdminDashboardPage').then((m) => ({ default: m.AdminDashboardPage }))
+)
+const VerificationPage = lazy(() =>
+  import('@/pages/VerificationPage').then((m) => ({ default: m.VerificationPage }))
+)
+const RoutePlannerPage = lazy(() =>
+  import('@/pages/RoutePlannerPage').then((m) => ({ default: m.RoutePlannerPage }))
+)
+const MessagingPage = lazy(() =>
+  import('@/pages/MessagingPage').then((m) => ({ default: m.MessagingPage }))
+)
+const WasteComparisonPage = lazy(() =>
+  import('@/pages/WasteComparisonPage').then((m) => ({ default: m.WasteComparisonPage }))
+)
+const PredictiveAnalyticsPage = lazy(() =>
+  import('@/pages/PredictiveAnalyticsPage').then((m) => ({ default: m.PredictiveAnalyticsPage }))
+)
+const WasteMarketplacePage = lazy(() =>
+  import('@/pages/WasteMarketplacePage').then((m) => ({ default: m.WasteMarketplacePage }))
+)
+const WasteCertificationPage = lazy(() =>
+  import('@/pages/WasteCertificationPage').then((m) => ({ default: m.WasteCertificationPage }))
+)
+const RecyclingGuidePage = lazy(() =>
+  import('@/pages/RecyclingGuidePage').then((m) => ({ default: m.RecyclingGuidePage }))
+)
 
 // eslint-disable-next-line react-refresh/only-export-components
 function PageFallback() {
@@ -51,7 +105,7 @@ export const router = createBrowserRouter([
       { path: 'dashboard', element: <HomePage /> },
       { path: 'submit', element: <div>Submit Waste</div> },
       { path: 'collect', element: <CollectorDashboardPage /> },
-      { path: 'incentives', element: <IncentivesPage /> },
+      { path: 'incentives', element: <IncentivesMarketplacePage /> },
       { path: 'transfer', element: <div>Transfer</div> },
       { path: 'history', element: <div>History</div> },
       { path: 'dashboard/recycler', element: <RecyclerDashboard /> },
@@ -60,7 +114,19 @@ export const router = createBrowserRouter([
       { path: 'settings', element: <SettingsPage /> },
       { path: 'rewards', element: <RewardsPage /> },
       { path: 'tracker', element: <SupplyChainTrackerPage /> },
-    ],
+      { path: 'community', element: <CommunityPage /> },
+      { path: 'analytics', element: <AnalyticsPage /> },
+      { path: 'map', element: <WasteMapPage /> },
+      { path: 'admin', element: <AdminDashboardPage /> },
+      { path: 'verify', element: <VerificationPage /> },
+      { path: 'route-planner', element: <RoutePlannerPage /> },
+      { path: 'messages', element: <MessagingPage /> },
+      { path: 'compare', element: <WasteComparisonPage /> },
+      { path: 'predictions', element: <PredictiveAnalyticsPage /> },
+      { path: 'marketplace', element: <WasteMarketplacePage /> },
+      { path: 'certifications', element: <WasteCertificationPage /> },
+      { path: 'recycling-guide', element: <RecyclingGuidePage /> }
+    ]
   },
-  { path: '*', element: <NotFoundPage /> },
+  { path: '*', element: <NotFoundPage /> }
 ])
