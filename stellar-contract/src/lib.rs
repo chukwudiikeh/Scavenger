@@ -5,12 +5,18 @@ mod events;
 mod types;
 mod validation;
 mod test_transfer_path_validation;
+mod versioning;
+mod audit_log;
+mod search;
 
 pub use errors::Error;
 pub use types::{
     GlobalMetrics, Incentive, Material, ParticipantRole, RecyclingStats, TransferItemType,
     TransferRecord, TransferStatus, Waste, WasteTransfer, WasteType,
 };
+pub use versioning::{ApiVersion, VersionInfo, get_version_info};
+pub use audit_log::{AuditLog, AuditLogFilter, AuditLogService};
+pub use search::{SearchResult, SearchQuery, SearchService};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
